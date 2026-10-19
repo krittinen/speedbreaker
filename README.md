@@ -661,6 +661,25 @@ The supported executable is 3,936,256 bytes, with SHA-256
   distrobox enter nfsmw-build
   ```
 
+- **Windows (MSYS2 UCRT64):** install MSYS2, open the **UCRT64** terminal, and install the
+  toolchain and runtime development libraries:
+
+  ```sh
+  pacman -Syu
+  # If the update closes the terminal, reopen UCRT64 before continuing.
+  pacman -S --needed base-devel git curl \
+    mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld \
+    mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+    mingw-w64-ucrt-x86_64-SDL3 \
+    mingw-w64-ucrt-x86_64-vulkan-headers mingw-w64-ucrt-x86_64-vulkan-loader \
+    mingw-w64-ucrt-x86_64-glslang mingw-w64-ucrt-x86_64-spirv-tools
+  ```
+
+  Run the remaining setup and build commands from the UCRT64 terminal. `scripts/setup_tools.sh`
+  builds the patched FFmpeg XMA decoder and the recompilation tools; CMake uses the MSYS2 SDL3,
+  Vulkan, glslang and SPIRV-Tools packages and copies required runtime DLLs beside the executable.
+  The Vulkan graphics driver must also be installed for your GPU.
+
 - **Other Linux distributions:** your distribution's equivalents of the package list above
   (Clang 18 or newer). Untested so far. The GPU needs Vulkan 1.2 and BC (DXT) texture support.
 - `gh`, logged in, is optional: it fetches Xenia's instruction tests.
@@ -690,7 +709,7 @@ tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/nfsmw.toml tools/XenonRec
 cmake -S . -B build/main -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
-# Windows (MSYS2 UCRT64)
+# Windows (run in the MSYS2 UCRT64 terminal)
 cmake -S . -B build/main -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 # CMake copies the required runtime DLLs beside SpeedBreaker.exe.
