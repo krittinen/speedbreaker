@@ -10,7 +10,11 @@ namespace gpu::clock
         std::map<uint64_t, uint64_t> ReadTimes(const std::filesystem::path& file)
         {
             std::map<uint64_t, uint64_t> times;
+#ifdef _WIN32
+            FILE* f = _wfopen(file.c_str(), L"r");
+#else
             FILE* f = fopen(file.c_str(), "r");
+#endif
             if (!f)
                 return times;
             char line[1024];

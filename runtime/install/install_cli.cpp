@@ -18,7 +18,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace install
 {
@@ -29,10 +34,22 @@ namespace install
 
         std::atomic<bool> s_cancel{ false };
 
+#ifndef _WIN32
         void OnInterrupt(int)
         {
             s_cancel.store(true, std::memory_order_relaxed);
         }
+#else
+        BOOL WINAPI OnConsoleInterrupt(DWORD event)
+        {
+            if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT || event == CTRL_CLOSE_EVENT)
+            {
+                s_cancel.store(true, std::memory_order_relaxed);
+                return TRUE;
+            }
+            return FALSE;
+        }
+#endif
 
         // Ctrl-C (or a SIGTERM) asks the install to stop between chunks, so it
         // deletes its partial copy instead of leaving gigabytes behind. The
@@ -43,22 +60,34 @@ namespace install
             InterruptGuard()
             {
                 s_cancel.store(false);
+#ifdef _WIN32
+                if (!SetConsoleCtrlHandler(OnConsoleInterrupt, TRUE))
+                    fprintf(stderr, "[install] couldn't install the console interrupt handler: %lu\n",
+                        static_cast<unsigned long>(GetLastError()));
+#else
                 struct sigaction sa{};
                 sa.sa_handler = OnInterrupt;
                 sa.sa_flags = SA_RESETHAND;
                 sigemptyset(&sa.sa_mask);
                 sigaction(SIGINT, &sa, &previousInt);
                 sigaction(SIGTERM, &sa, &previousTerm);
+#endif
             }
 
             ~InterruptGuard()
             {
+#ifdef _WIN32
+                SetConsoleCtrlHandler(OnConsoleInterrupt, FALSE);
+#else
                 sigaction(SIGINT, &previousInt, nullptr);
                 sigaction(SIGTERM, &previousTerm, nullptr);
+#endif
             }
 
         private:
+#ifndef _WIN32
             struct sigaction previousInt{}, previousTerm{};
+#endif
         };
 
         // One rewritten status line on a terminal; a line per file otherwise
@@ -105,7 +134,11 @@ namespace install
             }
 
         private:
+#ifdef _WIN32
+            bool tty = _isatty(_fileno(stdout));
+#else
             bool tty = isatty(STDOUT_FILENO);
+#endif
             bool printed = false;
             std::string lastFile;
             Clock::time_point start = Clock::now(), lastPrint{};
@@ -133,7 +166,7 @@ namespace install
             Result r = OpenDiscSource(path, source);
             if (!r.Ok())
                 return r;
-            printf("Source: %s (%s, %zu files)\n", source->Path().c_str(),
+            printf("Source: %s (%s, %zu files)\n", source->Path().string().c_str(),
                 source->Kind() == SourceKind::Image ? "disc image" : "folder", source->Files().size());
             return {};
         }
@@ -205,7 +238,7 @@ namespace install
             std::vector<DiscImageCandidate> images = FindDiscImages(where, 1ull << 30, &s_cancel);
             for (const DiscImageCandidate& image : images)
             {
-                printf("  %-6s %s  (%s)\n", image.status.Ok() ? "ready" : "no", image.path.c_str(),
+                printf("  %-6s %s  (%s)\n", image.status.Ok() ? "ready" : "no", image.path.string().c_str(),
                     FormatSize(image.size).c_str());
                 if (!image.status.Ok())
                     printf("         %s: %s\n", ErrorName(image.status.error), image.status.message.c_str());
@@ -220,10 +253,10 @@ namespace install
         {
             const portable::Layout& layout = portable::Current();
             if (layout.Active())
-                printf("Portable mode (%s in %s): data in %s, caches in %s\n", portable::kMarker, layout.root.c_str(),
-                    GetUserPath().c_str(), GetCachePath().c_str());
+                printf("Portable mode (%s in %s): data in %s, caches in %s\n", portable::kMarker, layout.root.string().c_str(),
+                    GetUserPath().string().c_str(), GetCachePath().string().c_str());
             else
-                printf("Data in %s, caches in %s\n", GetUserPath().c_str(), GetCachePath().c_str());
+                printf("Data in %s, caches in %s\n", GetUserPath().string().c_str(), GetCachePath().string().c_str());
         }
 
         int RunWhere()
@@ -246,7 +279,7 @@ namespace install
             }
             const char* origin = game->origin == InstallOrigin::Environment ? "NFSMW_GAME_DIR"
                 : game->origin == InstallOrigin::Development ? "development checkout" : "installed";
-            printf("%s (%s%s)\n", game->path.c_str(), origin, game->marker ? ", verified by the installer" : "");
+            printf("%s (%s%s)\n", game->path.string().c_str(), origin, game->marker ? ", verified by the installer" : "");
             PrintDataFolders();
             return 0;
         }
@@ -267,7 +300,7 @@ namespace install
                 std::unique_ptr<DiscSource> source;
                 if (Result r = OpenDiscSource(from, source); !r.Ok())
                     return r;
-                printf("Copying the game from %s (%s), checking every file:\n", from.c_str(),
+                printf("Copying the game from %s (%s), checking every file:\n", from.string().c_str(),
                     FormatSize(GameManifest().totalBytes).c_str());
                 ProgressPrinter printer;
                 Result r = Install(*source, to, std::ref(printer), &s_cancel);

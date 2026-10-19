@@ -27,7 +27,12 @@
 // Header only (tests/clean_exit_test.cpp).
 #pragma once
 #include <atomic>
+#include <cstdio>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <csignal>
+#endif
 
 namespace quitsignals
 {
@@ -41,15 +46,44 @@ namespace quitsignals
             int none = 0;
             g_requested.compare_exchange_strong(none, sig, std::memory_order_relaxed);
         }
+
+#ifdef _WIN32
+        inline BOOL WINAPI ConsoleHandler(DWORD event)
+        {
+            switch (event)
+            {
+            case CTRL_C_EVENT:
+            case CTRL_BREAK_EVENT:
+                Handle(SIGINT);
+                return TRUE;
+            case CTRL_CLOSE_EVENT:
+            case CTRL_LOGOFF_EVENT:
+            case CTRL_SHUTDOWN_EVENT:
+                Handle(SIGTERM);
+                return TRUE;
+            default:
+                return FALSE;
+            }
+        }
+#endif
     }
 
     // The signals a player or the system ends the game with.
+#ifdef _WIN32
+    inline constexpr int kSignals[] = { SIGTERM, SIGINT };
+#else
     inline constexpr int kSignals[] = { SIGTERM, SIGINT, SIGHUP };
+#endif
 
     // Main thread, before SDL starts (video::Initialize), so SDL leaves these
     // signals to us.
     inline void Install()
     {
+#ifdef _WIN32
+        if (!SetConsoleCtrlHandler(detail::ConsoleHandler, TRUE))
+            fprintf(stderr, "[runtime] SetConsoleCtrlHandler failed with error %lu\n",
+                static_cast<unsigned long>(GetLastError()));
+#else
         for (int sig : kSignals)
         {
             struct sigaction old{};
@@ -62,6 +96,7 @@ namespace quitsignals
             sa.sa_flags = SA_RESTART;
             sigaction(sig, &sa, nullptr);
         }
+#endif
     }
 
     // The signal that asked the game to quit, 0 if none has. Any thread.
@@ -77,7 +112,9 @@ namespace quitsignals
         {
         case SIGTERM: return "SIGTERM";
         case SIGINT: return "SIGINT";
+#ifndef _WIN32
         case SIGHUP: return "SIGHUP";
+#endif
         default: return "a signal";
         }
     }

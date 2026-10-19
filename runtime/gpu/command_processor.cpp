@@ -1201,7 +1201,7 @@ namespace gpu
                 // is replayed meanwhile.
                 while (true)
                 {
-                    std::this_thread::sleep_until(steady_clock::time_point(nanoseconds(next)));
+                    video::WaitVblankUntil(timer, next);
                     guesttime::WaitWhileSuspended();
                     int64_t nowPaused = guesttime::PausedNs();
                     if (nowPaused == paused)

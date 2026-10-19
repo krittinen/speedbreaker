@@ -13,16 +13,22 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <windows.h>
+#endif
 #ifdef __APPLE__
 #include <TargetConditionals.h>  // TARGET_OS_IOS: __APPLE__ alone means macOS or iOS
 #endif
@@ -799,6 +805,52 @@ namespace settings
         // of a regular file.
         ReadStatus ReadFile(const std::filesystem::path& path, std::string& out, std::string& error)
         {
+#ifdef _WIN32
+            HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            if (file == INVALID_HANDLE_VALUE)
+            {
+                DWORD code = GetLastError();
+                if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+                    return ReadStatus::Missing;
+                error = std::system_category().message(int(code));
+                return ReadStatus::Failed;
+            }
+            BY_HANDLE_FILE_INFORMATION information{};
+            LARGE_INTEGER size{};
+            if (!GetFileInformationByHandle(file, &information) || !GetFileSizeEx(file, &size))
+                error = std::system_category().message(int(GetLastError()));
+            else if (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                error = "it's a folder";
+            else if (GetFileType(file) != FILE_TYPE_DISK)
+                error = "it isn't a regular file";
+            else if (uint64_t(size.QuadPart) > kMaxFileSize)
+                error = std::format("it's {} KB, too big for a settings file", uint64_t(size.QuadPart) / 1024);
+            if (!error.empty())
+            {
+                CloseHandle(file);
+                return ReadStatus::Failed;
+            }
+            char buffer[4096];
+            for (;;)
+            {
+                DWORD n = 0;
+                if (!::ReadFile(file, buffer, sizeof(buffer), &n, nullptr))
+                {
+                    error = std::system_category().message(int(GetLastError()));
+                    break;
+                }
+                if (n == 0)
+                    break;
+                out.append(buffer, size_t(n));
+                if (out.size() > kMaxFileSize)
+                {
+                    error = "it's too big for a settings file";
+                    break;
+                }
+            }
+            CloseHandle(file);
+#else
             int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
             if (fd < 0)
             {
@@ -842,6 +894,7 @@ namespace settings
                 }
             }
             close(fd);
+#endif
             return error.empty() ? ReadStatus::Ok : ReadStatus::Failed;
         }
 
@@ -985,6 +1038,46 @@ namespace settings
             }
             RemoveStaleTemps(target);
             std::filesystem::path temp = target;
+#ifdef _WIN32
+            temp += std::format(".{}.tmp", GetCurrentProcessId());
+            HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            if (file == INVALID_HANDLE_VALUE && (GetLastError() == ERROR_FILE_EXISTS
+                || GetLastError() == ERROR_ALREADY_EXISTS))
+            {
+                DeleteFileW(temp.c_str());
+                file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            }
+            if (file == INVALID_HANDLE_VALUE)
+                return std::format("can't write {}: {}", target.string(),
+                    std::system_category().message(int(GetLastError())));
+            DWORD error = ERROR_SUCCESS;
+            for (size_t done = 0; !error && done < text.size();)
+            {
+                DWORD amount = DWORD(std::min<size_t>(text.size() - done, 1u << 30));
+                DWORD written = 0;
+                if (!WriteFile(file, text.data() + done, amount, &written, nullptr))
+                    error = GetLastError();
+                else if (written == 0)
+                    error = ERROR_WRITE_FAULT;
+                else
+                    done += written;
+            }
+            if (!error && !FlushFileBuffers(file))
+                error = GetLastError();
+            CloseHandle(file);
+            if (error)
+            {
+                DeleteFileW(temp.c_str());
+                return std::format("can't write {}: {}", target.string(), std::system_category().message(int(error)));
+            }
+            if (!MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                error = GetLastError();
+                DeleteFileW(temp.c_str());
+                return std::format("can't replace {}: {}", target.string(), std::system_category().message(int(error)));
+            }
+#else
             temp += std::format(".{}.tmp", long(getpid()));
             int fd = open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
             if (fd < 0 && errno == EEXIST)
@@ -1034,6 +1127,7 @@ namespace settings
                 fsync(dirFd);  // best effort: some file systems refuse it on directories
                 close(dirFd);
             }
+#endif
             return "";
         }
 
@@ -1291,6 +1385,18 @@ namespace settings
 
     std::filesystem::path DefaultPath()
     {
+#ifdef _WIN32
+        if (const portable::Layout& layout = portable::Current(); layout.Active())
+            return layout.data / "settings.toml";
+        wchar_t localAppData[32768]{};
+        DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, DWORD(std::size(localAppData)));
+        if (length && length < std::size(localAppData))
+            return std::filesystem::path(localAppData) / DataFolderName() / "settings.toml";
+        wchar_t profile[32768]{};
+        length = GetEnvironmentVariableW(L"USERPROFILE", profile, DWORD(std::size(profile)));
+        if (length && length < std::size(profile))
+            return std::filesystem::path(profile) / "AppData/Local" / DataFolderName() / "settings.toml";
+#endif
         return GetUserPath() / "settings.toml";
     }
 
@@ -1309,10 +1415,10 @@ namespace settings
         size_t fromFile = 0;
         ReadStatus status = ReadFile(path, text, readError);
         if (status == ReadStatus::Missing)
-            fprintf(stderr, "[settings] no %s yet: defaults\n", path.c_str());
+            fprintf(stderr, "[settings] no %s yet: defaults\n", path.string().c_str());
         else if (status == ReadStatus::Failed)
         {
-            fprintf(stderr, "[settings] can't read %s: %s; defaults\n", path.c_str(), readError.c_str());
+            fprintf(stderr, "[settings] can't read %s: %s; defaults\n", path.string().c_str(), readError.c_str());
             lastError = std::format("Couldn't read {}: {}. The settings are at their defaults.", path.string(), readError);
         }
         else
@@ -1347,8 +1453,9 @@ namespace settings
                 bad += ".bad";
                 std::error_code ec;
                 std::filesystem::copy_file(path, bad, std::filesystem::copy_options::overwrite_existing, ec);
-                fprintf(stderr, "[settings] %s doesn't parse: %s (line %u, column %u); defaults (kept as %s)\n", path.c_str(),
-                    error.c_str(), unsigned(where.line), unsigned(where.column), ec ? "nothing: the copy failed" : bad.c_str());
+                fprintf(stderr, "[settings] %s doesn't parse: %s (line %u, column %u); defaults (kept as %s)\n",
+                    path.string().c_str(), error.c_str(), unsigned(where.line), unsigned(where.column),
+                    ec ? "nothing: the copy failed" : bad.string().c_str());
                 lastError = std::format("{} has a mistake at line {}, column {} ({}). The settings are at their defaults; {}.",
                     path.string(), where.line, where.column, error,
                     ec ? "saving them will replace the file" : std::format("the file was kept as {}", bad.string()));
@@ -1358,7 +1465,7 @@ namespace settings
                 const toml::table* table = tableNode.as_table();
                 if (!table)
                 {
-                    fprintf(stderr, "[settings] %s: %s outside a table; ignored\n", path.filename().c_str(),
+                    fprintf(stderr, "[settings] %s: %s outside a table; ignored\n", path.filename().string().c_str(),
                         std::string(tableKey.str()).c_str());
                     continue;
                 }
@@ -1379,14 +1486,14 @@ namespace settings
                         if (auto v = node.as_string())
                             lastVersion = v->get();
                         else
-                            fprintf(stderr, "[settings] %s: %s = %s isn't a version; ignored\n", path.filename().c_str(), name.c_str(),
+                            fprintf(stderr, "[settings] %s: %s = %s isn't a version; ignored\n", path.filename().string().c_str(), name.c_str(),
                                 NodeText(node).c_str());
                         continue;
                     }
                     const Option* o = Find(tableKey.str(), key.str());
                     if (!o)
                     {
-                        fprintf(stderr, "[settings] %s: unknown key %s; ignored\n", path.filename().c_str(), name.c_str());
+                        fprintf(stderr, "[settings] %s: unknown key %s; ignored\n", path.filename().string().c_str(), name.c_str());
                         continue;
                     }
                     std::string source = std::format("{}: {} = {}", path.filename().string(), name, NodeText(node));
@@ -1398,7 +1505,8 @@ namespace settings
                 }
             }
             if (error.empty())
-                fprintf(stderr, "[settings] %s: %zu value%s from the file\n", path.c_str(), fromFile, fromFile == 1 ? "" : "s");
+                fprintf(stderr, "[settings] %s: %zu value%s from the file\n", path.string().c_str(), fromFile,
+                    fromFile == 1 ? "" : "s");
         }
 
         std::vector<Id> changed;
@@ -1465,7 +1573,7 @@ namespace settings
             fprintf(stderr, "[settings] %s\n", error.c_str());
             return false;
         }
-        fprintf(stderr, "[settings] saved %s\n", path.c_str());
+        fprintf(stderr, "[settings] saved %s\n", path.string().c_str());
         return true;
     }
 
@@ -1511,7 +1619,8 @@ namespace settings
         ReadStatus status = ReadFile(path, text, error);
         if (status == ReadStatus::Failed)
         {
-            fprintf(stderr, "[settings] the version isn't recorded: can't read %s: %s\n", path.c_str(), error.c_str());
+            fprintf(stderr, "[settings] the version isn't recorded: can't read %s: %s\n", path.string().c_str(),
+                error.c_str());
             return false;
         }
         if (status == ReadStatus::Missing)

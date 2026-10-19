@@ -176,7 +176,13 @@ namespace
         const auto started = steady_clock::now();
         while (s_running)
         {
+#ifdef _WIN32
+            const auto remaining = next - steady_clock::now();
+            if (remaining > steady_clock::duration::zero())
+                SDL_DelayPrecise(uint64_t(duration_cast<nanoseconds>(remaining).count()));
+#else
             std::this_thread::sleep_until(next);
+#endif
             if (stallAt >= 0 && stallState < 2 && s_stream)
             {
                 const double t = duration<double>(steady_clock::now() - started).count();

@@ -28,15 +28,26 @@
 #include <unordered_set>
 
 #include <fcntl.h>
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <windows.h>
+#endif
 
 namespace install
 {
     namespace
     {
         namespace fs = std::filesystem;
+#ifndef _WIN32
         static_assert(sizeof(off_t) == 8, "large file offsets are required");
+        using FileHandle = int;
+        constexpr FileHandle kInvalidFile = -1;
+#else
+        using FileHandle = HANDLE;
+        const FileHandle kInvalidFile = INVALID_HANDLE_VALUE;
+#endif
 
         constexpr uint64_t kSectorSize = 2048;
         // Where the game partition starts: plain XISO (0), older rips
@@ -99,12 +110,31 @@ namespace install
 
         // pread until `size` bytes or the end of the file. Returns the bytes
         // read (fewer only at the end), or -1 with errno set.
-        int64_t PreadAll(int fd, void* buffer, size_t size, uint64_t offset)
+        int64_t PreadAll(FileHandle fd, void* buffer, size_t size, uint64_t offset)
         {
             auto p = static_cast<uint8_t*>(buffer);
             size_t done = 0;
             while (done < size)
             {
+#ifdef _WIN32
+                DWORD amount = DWORD(std::min<size_t>(size - done, 1u << 30));
+                OVERLAPPED overlapped{};
+                uint64_t position = offset + done;
+                overlapped.Offset = DWORD(position);
+                overlapped.OffsetHigh = DWORD(position >> 32);
+                DWORD got = 0;
+                BOOL ok = ReadFile(fd, p + done, amount, &got, &overlapped);
+                if (!ok && GetLastError() == ERROR_IO_PENDING)
+                    ok = GetOverlappedResult(fd, &overlapped, &got, TRUE);
+                if (!ok && GetLastError() != ERROR_HANDLE_EOF)
+                {
+                    DWORD error = GetLastError();
+                    errno = error == ERROR_ACCESS_DENIED ? EACCES
+                        : error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? ENOENT : EIO;
+                    return -1;
+                }
+                int64_t n = ok ? int64_t(got) : 0;
+#else
                 ssize_t n = pread(fd, p + done, std::min<size_t>(size - done, 1u << 30), off_t(offset + done));
                 if (n < 0)
                 {
@@ -112,6 +142,7 @@ namespace install
                         continue;
                     return -1;
                 }
+#endif
                 if (n == 0)
                     break;
                 done += size_t(n);
@@ -119,7 +150,8 @@ namespace install
             return int64_t(done);
         }
 
-        bool ReadExact(int fd, uint64_t base, uint64_t limit, uint64_t offset, void* buffer, size_t size, std::string& error)
+        bool ReadExact(FileHandle fd, uint64_t base, uint64_t limit, uint64_t offset, void* buffer, size_t size,
+            std::string& error)
         {
             if (offset > limit || size > limit - offset)
             {
@@ -140,10 +172,14 @@ namespace install
             return true;
         }
 
-        void AdviseSequential(int fd)
+        void AdviseSequential(FileHandle fd)
         {
+#ifndef _WIN32
 #ifdef POSIX_FADV_SEQUENTIAL
             posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#else
+            (void)fd;
+#endif
 #else
             (void)fd;
 #endif
@@ -153,13 +189,17 @@ namespace install
 
         struct ImageFile
         {
-            int fd = -1;
+            FileHandle fd = kInvalidFile;
             uint64_t size = 0;
 
             ~ImageFile()
             {
-                if (fd >= 0)
+                if (fd != kInvalidFile)
+#ifdef _WIN32
+                    CloseHandle(fd);
+#else
                     close(fd);
+#endif
             }
         };
 
@@ -385,13 +425,27 @@ namespace install
         Result OpenImage(const fs::path& path, std::unique_ptr<DiscSource>& source, const OpenOptions& options)
         {
             auto image = std::make_shared<ImageFile>();
+#ifdef _WIN32
+            image->fd = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+            if (image->fd == INVALID_HANDLE_VALUE)
+                errno = GetLastError() == ERROR_ACCESS_DENIED ? EACCES : ENOENT;
+#else
             image->fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-            if (image->fd < 0)
+#endif
+            if (image->fd == kInvalidFile)
                 return Fail(Error::NotFound, std::format("Cannot open {}: {}.", path.string(), strerror(errno)), path.string());
+#ifdef _WIN32
+            LARGE_INTEGER fileSize{};
+            if (!GetFileSizeEx(image->fd, &fileSize))
+                return Fail(Error::ReadError, std::format("Cannot read {}: {}.", path.string(), strerror(EIO)), path.string());
+            image->size = uint64_t(fileSize.QuadPart);
+#else
             struct stat st;
             if (fstat(image->fd, &st) != 0)
                 return Fail(Error::ReadError, std::format("Cannot read {}: {}.", path.string(), strerror(errno)), path.string());
             image->size = uint64_t(st.st_size);
+#endif
             AdviseSequential(image->fd);
 
             // Try each partition offset with the magic, first to last, and keep
@@ -470,11 +524,15 @@ namespace install
         class FolderReader : public FileReader
         {
         public:
-            FolderReader(int fd, uint64_t size) : fd(fd), size(size) {}
+            FolderReader(FileHandle fd, uint64_t size) : fd(fd), size(size) {}
 
             ~FolderReader() override
             {
+#ifdef _WIN32
+                CloseHandle(fd);
+#else
                 close(fd);
+#endif
             }
 
             bool Read(uint64_t at, void* buffer, size_t count, std::string& error) override
@@ -483,7 +541,7 @@ namespace install
             }
 
         private:
-            int fd;
+            FileHandle fd;
             uint64_t size;
         };
 
@@ -500,8 +558,15 @@ namespace install
             std::unique_ptr<FileReader> Open(const DiscFile& file, std::string& error) const override
             {
                 fs::path host = path / fs::path(file.path);
+#ifdef _WIN32
+                FileHandle fd = CreateFileW(host.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+                if (fd == INVALID_HANDLE_VALUE)
+                    errno = GetLastError() == ERROR_ACCESS_DENIED ? EACCES : ENOENT;
+#else
                 int fd = open(host.c_str(), O_RDONLY | O_CLOEXEC);
-                if (fd < 0)
+#endif
+                if (fd == kInvalidFile)
                 {
                     error = strerror(errno);
                     return nullptr;
@@ -570,8 +635,20 @@ namespace install
             std::set<std::pair<uint64_t, uint64_t>> entered;
             auto firstEntry = [&](const fs::path& dir)
             {
+#ifdef _WIN32
+                HANDLE handle = CreateFileW(dir.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                if (handle == INVALID_HANDLE_VALUE)
+                    return false;
+                BY_HANDLE_FILE_INFORMATION info{};
+                bool ok = GetFileInformationByHandle(handle, &info) != 0;
+                CloseHandle(handle);
+                return ok && entered.insert({ info.dwVolumeSerialNumber,
+                    (uint64_t(info.nFileIndexHigh) << 32) | info.nFileIndexLow }).second;
+#else
                 struct stat st;
                 return stat(dir.c_str(), &st) == 0 && entered.insert({ uint64_t(st.st_dev), uint64_t(st.st_ino) }).second;
+#endif
             };
             firstEntry(root);
 

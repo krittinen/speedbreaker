@@ -20,6 +20,7 @@
 #include "xdm.h"
 
 #ifdef _WIN32
+using NTSTATUS = LONG;
 #include <ntstatus.h>
 #endif
 
@@ -235,7 +236,15 @@ void KeSetBasePriorityThread(GuestThreadHandle* hThread, int priority)
         priority = -15;
     }
 
-    SetThreadPriority(hThread == GetKernelObject(CURRENT_THREAD_HANDLE) ? GetCurrentThread() : hThread->thread.native_handle(), priority);
+    HANDLE thread = GetCurrentThread();
+    if (hThread != GetKernelObject(CURRENT_THREAD_HANDLE))
+        thread = OpenThread(THREAD_SET_INFORMATION, FALSE, hThread->nativeThreadId);
+    if (thread)
+    {
+        SetThreadPriority(thread, priority);
+        if (thread != GetCurrentThread())
+            CloseHandle(thread);
+    }
 #endif
 }
 

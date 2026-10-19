@@ -17,7 +17,7 @@ uint32_t NtClose(uint32_t handle);
 
 constexpr uint32_t CURRENT_PROCESS_PSEUDO = 0xFFFFFFFF;
 constexpr uint32_t CURRENT_THREAD_PSEUDO = 0xFFFFFFFE;
-constexpr uint32_t DUPLICATE_CLOSE_SOURCE = 0x1;
+constexpr uint32_t kDuplicateCloseSource = 0x1;
 
 uint32_t NtDuplicateObject(uint32_t sourceHandle, be<uint32_t>* targetHandle, uint32_t options)
 {
@@ -32,7 +32,7 @@ uint32_t NtDuplicateObject(uint32_t sourceHandle, be<uint32_t>* targetHandle, ui
     RetainKernelObject(obj);
     if (targetHandle)
         *targetHandle = GetKernelHandle(obj);
-    if ((options & DUPLICATE_CLOSE_SOURCE) && sourceHandle != CURRENT_THREAD_PSEUDO)
+    if ((options & kDuplicateCloseSource) && sourceHandle != CURRENT_THREAD_PSEUDO)
         NtClose(sourceHandle);
     return STATUS_SUCCESS;
 }

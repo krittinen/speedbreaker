@@ -42,8 +42,12 @@
 #include <cerrno>
 #include <csignal>
 #include <map>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <pthread.h>
 #include <unistd.h>
+#endif
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -193,6 +197,14 @@ namespace
         return nullptr;
     }
 
+#ifdef _WIN32
+    unsigned __stdcall GuestMainWindows(void* arg)
+    {
+        GuestMain(arg);
+        return 0;
+    }
+#endif
+
     // default.xex in a game folder, whatever its case (a tool may have
     // written DEFAULT.XEX; Linux file systems are case-sensitive).
     std::filesystem::path FindXex(const std::filesystem::path& dir)
@@ -240,6 +252,7 @@ namespace
     }
 #endif
 
+#ifndef _WIN32
     void CrashHandler(int sig, siginfo_t* info, void* context)
     {
         // A store to a write-watched page (textures), or an access to one
@@ -270,6 +283,27 @@ namespace
         report::WriteCrashReport(sig, info, context);
         _exit(128 + sig);
     }
+#else
+    LONG CALLBACK WriteWatchExceptionHandler(EXCEPTION_POINTERS* exception)
+    {
+        EXCEPTION_RECORD* record = exception->ExceptionRecord;
+        if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2)
+            return EXCEPTION_CONTINUE_SEARCH;
+        ULONG_PTR operation = record->ExceptionInformation[0];
+        if (operation > 1)
+            return EXCEPTION_CONTINUE_SEARCH;
+        writewatch::t_faultPc = reinterpret_cast<const void*>(exception->ContextRecord->Rip);
+        if (writewatch::HandleFault(reinterpret_cast<const void*>(record->ExceptionInformation[1]), operation == 1))
+            return EXCEPTION_CONTINUE_EXECUTION;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    LONG WINAPI UnhandledExceptionHandler(EXCEPTION_POINTERS* exception)
+    {
+        report::WriteCrashReport(exception);
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+#endif
 }
 
 int main(int argc, char** argv)
@@ -358,11 +392,22 @@ int main(int argc, char** argv)
     guesttime::SetResumeHook(dispatcher::WakeAfterResume);
 
     report::PrepareCrashReports();
+#ifdef _WIN32
+    if (!AddVectoredExceptionHandler(1, WriteWatchExceptionHandler))
+    {
+        fprintf(stderr, "[runtime] couldn't install the guest-memory exception handler: %lu\n",
+            static_cast<unsigned long>(GetLastError()));
+        report::ClearCrashMarker();
+        return 1;
+    }
+    SetUnhandledExceptionFilter(UnhandledExceptionHandler);
+#else
     struct sigaction sa{};
     sa.sa_sigaction = CrashHandler;
     sa.sa_flags = SA_SIGINFO;
     for (int sig : { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGABRT })
         sigaction(sig, &sa, nullptr);
+#endif
     // SIGTERM, SIGINT and SIGHUP quit the game as its window's close button
     // does (platform/quit_signals.h): before SDL starts, which leaves them to
     // us.
@@ -446,6 +491,27 @@ int main(int argc, char** argv)
     // game runs in a container, not as the launcher's child, so Steam
     // stopping the launcher never reaches it: exit once the launcher is gone.
     if (const char* v = std::getenv("NFSMW_LIFELINE_PID"))
+#ifdef _WIN32
+    {
+        DWORD lifeline = DWORD(std::strtoul(v, nullptr, 10));
+        HANDLE process = lifeline > 1 ? OpenProcess(SYNCHRONIZE, FALSE, lifeline) : nullptr;
+        if (process)
+            std::thread([process, lifeline] {
+                WaitForSingleObject(process, INFINITE);
+                CloseHandle(process);
+                fprintf(stderr, "[runtime] launcher (pid %lu) is gone: exiting\n", static_cast<unsigned long>(lifeline));
+                if (settings::Dirty())
+                    settings::Save();
+                gpu::renderer::Shutdown();
+                report::ClearCrashMarker();
+                report::FlushLog();
+                std::_Exit(0);
+            }).detach();
+        else if (lifeline > 1)
+            fprintf(stderr, "[runtime] can't monitor launcher process %lu: error %lu\n",
+                static_cast<unsigned long>(lifeline), static_cast<unsigned long>(GetLastError()));
+    }
+#else
         if (pid_t lifeline = pid_t(std::atoi(v)); lifeline > 1)
             std::thread([lifeline] {
                 while (kill(lifeline, 0) == 0 || errno != ESRCH)
@@ -458,6 +524,7 @@ int main(int argc, char** argv)
                 report::FlushLog();
                 std::_Exit(0);
             }).detach();
+#endif
 
     std::filesystem::path xexPath;
     std::string gameOrigin;  // for the system summary
@@ -550,11 +617,29 @@ int main(int argc, char** argv)
     if (auto* stack = static_cast<const be<uint32_t>*>(getOptHeaderPtr(file.data(), XEX_HEADER_DEFAULT_STACK_SIZE)))
         params.stackSize = std::max<uint32_t>(*stack, DEFAULT_GUEST_STACK);
 
+#ifdef _WIN32
+    HANDLE thread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, DWORD(HOST_STACK), GuestMainWindows,
+        &params, 0, nullptr));
+    if (!thread)
+    {
+        fprintf(stderr, "[runtime] couldn't start the guest thread: %d\n", errno);
+        report::ClearCrashMarker();
+        return 1;
+    }
+#else
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, HOST_STACK);
     pthread_t thread;
-    pthread_create(&thread, &attr, GuestMain, &params);
+    const int threadError = pthread_create(&thread, &attr, GuestMain, &params);
+    pthread_attr_destroy(&attr);
+    if (threadError != 0)
+    {
+        fprintf(stderr, "[runtime] pthread_create failed with error code %d\n", threadError);
+        report::ClearCrashMarker();
+        return 1;
+    }
+#endif
     report::StartWatchdog();  // hang reports (and the NFSMW_TEST_* switches)
 
 #ifdef __linux__
@@ -580,7 +665,12 @@ int main(int argc, char** argv)
             report::FlushLog();
             std::_Exit(0);
         }
+#ifdef _WIN32
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+#else
         pthread_join(thread, nullptr);
+#endif
         report::FlushLog();
         return 0;
     }
@@ -597,13 +687,54 @@ int main(int argc, char** argv)
     hid::NoteGameStarting();
     while (video::RunFrame())
         ;
+    const bool guestReturned = s_guestReturned.load(std::memory_order_acquire);
+    fprintf(stderr, "[runtime] frame loop ended; guest thread %s\n", guestReturned ? "has returned" : "is still running");
+    if (!guestReturned)
+    {
+        fprintf(stderr, "[runtime] window closed while the game thread was still running; exiting without waiting for it\n");
+        if (settings::Dirty())
+        {
+            fprintf(stderr, "[runtime] saving settings before forced exit\n");
+            settings::Save();
+            fprintf(stderr, "[runtime] settings save finished\n");
+        }
+        fprintf(stderr, "[runtime] clearing crash marker before forced exit\n");
+        report::ClearCrashMarker();
+        fprintf(stderr, "[runtime] terminating process without waiting for the log writer\n");
+#ifdef _WIN32
+        // Do not run DLL detach handlers while the guest and its worker threads
+        // may still be using runtime state.
+        if (!TerminateProcess(GetCurrentProcess(), 0))
+        {
+            fprintf(stderr, "[runtime] TerminateProcess failed (Windows error %lu); falling back to _Exit\n",
+                static_cast<unsigned long>(GetLastError()));
+            std::_Exit(0);
+        }
+        Sleep(INFINITE);
+#else
+        std::_Exit(0);
+#endif
+    }
+#ifdef _WIN32
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+#else
+    pthread_join(thread, nullptr);
+#endif
     if (int sig = quitsignals::Requested())
         fprintf(stderr, "[runtime] %s: quitting, as the window's close button does\n", quitsignals::Name(sig));
     fprintf(stderr, "[runtime] window closed\n");
     if (settings::Dirty())
+    {
+        fprintf(stderr, "[runtime] saving settings\n");
         settings::Save();
+        fprintf(stderr, "[runtime] settings save finished\n");
+    }
+    fprintf(stderr, "[runtime] shutting down renderer\n");
     gpu::renderer::Shutdown();
+    fprintf(stderr, "[runtime] shutting down video\n");
     video::Shutdown();
+    fprintf(stderr, "[runtime] video shutdown finished\n");
     // A clean end: no crash marker left (a crash in the shutdown above still
     // reported one).
     report::ClearCrashMarker();

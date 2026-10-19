@@ -5,11 +5,10 @@
 #include <kernel/xdm.h>
 #include <kernel/dispatcher.h>
 
-// SpeedBreaker: pthreads on every platform (macOS and Linux), for the stack
-// size and so thread handles share one detached, reference-counted path.
+// pthreads provide configurable host stacks on POSIX. Windows uses native
+// detached threads so stack sizes and names follow the host APIs.
+#if !defined(_WIN32)
 #define USE_PTHREAD 1
-
-#ifdef USE_PTHREAD
 #include <pthread.h>
 #endif
 
@@ -47,7 +46,9 @@ struct GuestThreadHandle : Waitable
     bool finished = false;  // SpeedBreaker: guarded by dispatcher::Lock()
 #ifdef USE_PTHREAD
     pthread_t thread;
-#else
+#elif defined(_WIN32)
+    unsigned nativeThreadId = 0;
+#elif !defined(_WIN32)
     std::thread thread;
 #endif
 

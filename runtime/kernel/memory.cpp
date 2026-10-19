@@ -3,7 +3,41 @@
 #include "../stdafx.h"
 #include "memory.h"
 
-#ifndef _WIN32
+#ifdef _WIN32
+bool Memory::MapPhysicalMirrors()
+{
+    constexpr size_t physicalSize = 0x20000000;
+    HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+        DWORD(physicalSize), nullptr);
+    if (!mapping)
+    {
+        failedError = int(GetLastError());
+        return false;
+    }
+
+    void* views[3]{};
+    constexpr uint32_t offsets[] = { 0xA0000000, 0xC0000000, 0xE0000000 };
+    for (size_t i = 0; i < std::size(views); i++)
+    {
+        views[i] = MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, physicalSize, base + offsets[i]);
+        if (views[i] != base + offsets[i])
+        {
+            failedError = int(GetLastError());
+            for (void* view : views)
+                if (view)
+                    UnmapViewOfFile(view);
+            CloseHandle(mapping);
+            return false;
+        }
+    }
+    CloseHandle(mapping);
+
+    // Windows mapping offsets have 64 KiB allocation granularity, so the
+    // Xbox's 4 KiB physical offset in the 0xE window cannot be represented.
+    eWindowShift = 0;
+    return true;
+}
+#else
 #include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
@@ -97,16 +131,64 @@ bool Memory::MapPhysicalMirrors()
 Memory::Memory()
 {
 #ifdef _WIN32
-    base = (uint8_t*)VirtualAlloc((void*)0x100000000ull, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-    if (base == nullptr)
-        base = (uint8_t*)VirtualAlloc(nullptr, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-    if (base == nullptr)
+    const char* testFail = std::getenv("NFSMW_TEST_RESERVE_FAIL");
+    const int failStep = testFail ? std::atoi(testFail) : 0;
+    if (failStep == 1)
+    {
+        failedStep = 1;
+        failedError = ERROR_NOT_ENOUGH_MEMORY;
         return;
+    }
 
-    DWORD oldProtect;
-    VirtualProtect(base, 4096, PAGE_NOACCESS, &oldProtect);
+    // Reserve the complete guest address range to choose a base, then replace
+    // its physical-memory windows with views of one shared section.
+    base = static_cast<uint8_t*>(VirtualAlloc(nullptr, PPC_MEMORY_SIZE, MEM_RESERVE, PAGE_NOACCESS));
+    if (!base)
+    {
+        failedStep = 1;
+        failedError = int(GetLastError());
+        return;
+    }
+    uint8_t* candidate = base;
+    if (!VirtualFree(candidate, 0, MEM_RELEASE))
+    {
+        failedStep = 1;
+        failedError = int(GetLastError());
+        base = nullptr;
+        return;
+    }
+
+    constexpr size_t nonPhysicalSize = 0xA0000000;
+    base = static_cast<uint8_t*>(VirtualAlloc(candidate, nonPhysicalSize,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (base != candidate)
+    {
+        failedStep = 1;
+        failedError = int(GetLastError());
+        if (base)
+            VirtualFree(base, 0, MEM_RELEASE);
+        base = nullptr;
+        return;
+    }
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(base, 4096, PAGE_NOACCESS, &oldProtect))
+    {
+        failedStep = 1;
+        failedError = int(GetLastError());
+        VirtualFree(base, 0, MEM_RELEASE);
+        base = nullptr;
+        return;
+    }
+
+    if (failStep == 2 || !MapPhysicalMirrors())
+    {
+        failedStep = 2;
+        if (failStep == 2)
+            failedError = ERROR_NOT_ENOUGH_MEMORY;
+        VirtualFree(base, 0, MEM_RELEASE);
+        base = nullptr;
+        return;
+    }
 #else
     // NFSMW_TEST_RESERVE_FAIL=1|2: fail the reservation or the mirrors as an
     // iOS without room would (memory_status.h), to see the startup message

@@ -39,6 +39,12 @@ fi
 cmake -Wno-deprecated -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER="$LLVM/clang" -DCMAKE_CXX_COMPILER="$LLVM/clang++" \
   "-DCMAKE_CXX_FLAGS=-include cstdlib" > /dev/null
+if command -v cygpath >/dev/null 2>&1; then
+  # Native Windows Clang can't resolve MSYS paths embedded in the generated PCH header.
+  PCH_FILE="build/XenonRecomp/CMakeFiles/XenonRecomp.dir/cmake_pch.hxx"
+  PCH_HEADER="$(cygpath -m "$PWD/XenonRecomp/pch.h")"
+  sed -i "s|#include \".*XenonRecomp/pch.h\"|#include \"$PCH_HEADER\"|" "$PCH_FILE"
+fi
 ninja -C build XenonRecomp XenonAnalyse
 
 if [ ! -x "$TOOLS/extract-xiso/build/extract-xiso" ]; then

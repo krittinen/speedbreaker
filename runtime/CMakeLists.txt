@@ -17,6 +17,11 @@ target_compile_options(XenonUtilsLite PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include
 
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/thirdparty/")
+if(WIN32)
+    list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/report/(crash|watchdog)\\.cpp$")
+else()
+    list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/report/(crash|watchdog)_windows\\.cpp$")
+endif()
 # Nayuki's QR Code generator (thirdparty/qrcodegen, vendored, C): the
 # download page's code in Check for Updates. Part of the runtime itself, not
 # a library of its own, so the iOS app (scripts/ios/build.sh) links it too.
@@ -151,6 +156,27 @@ add_custom_target(nfsmw_build_info
 add_dependencies(SpeedBreaker nfsmw_build_info)
 
 target_link_libraries(SpeedBreaker PRIVATE NfsmwRecompLib XenonUtilsLite o1heap imgui SDL3::SDL3 Vulkan::Vulkan glslang::glslang glslang::glslang-default-resource-limits ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY})
+if(WIN32)
+    target_link_libraries(SpeedBreaker PRIVATE dbghelp bcrypt)
+    if(CMAKE_VERSION VERSION_LESS 3.21)
+        message(FATAL_ERROR "Windows runtime DLL deployment requires CMake 3.21 or newer")
+    endif()
+    get_filename_component(SB_WINDOWS_COMPILER_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(SB_WINDOWS_RUNTIME_DLLS)
+    foreach(dll libgcc_s_seh-1.dll libwinpthread-1.dll libstdc++-6.dll libiconv-2.dll)
+        set(path "${SB_WINDOWS_COMPILER_DIR}/${dll}")
+        if(EXISTS "${path}")
+            list(APPEND SB_WINDOWS_RUNTIME_DLLS "${path}")
+        endif()
+    endforeach()
+    add_custom_command(TARGET SpeedBreaker POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:SpeedBreaker>
+            ${SB_WINDOWS_RUNTIME_DLLS}
+            $<TARGET_FILE_DIR:SpeedBreaker>
+        COMMAND_EXPAND_LISTS
+        COMMENT "Copying runtime DLLs beside SpeedBreaker.exe")
+endif()
 # glslang before 15 (the Steam Frame's 14) keeps the C API's SPIR-V
 # generation in its own library.
 if(TARGET glslang::SPIRV)

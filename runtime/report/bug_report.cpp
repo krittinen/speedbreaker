@@ -23,9 +23,20 @@
 #include <fstream>
 #include <sstream>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace report
 {
@@ -44,10 +55,17 @@ namespace report
 
         std::filesystem::path DesktopFolder()
         {
+#ifdef _WIN32
+            const char* profile = std::getenv("USERPROFILE");
+            if (!profile || !*profile)
+                return {};
+            std::filesystem::path desktop = std::filesystem::path(profile) / "Desktop";
+#else
             const char* home = std::getenv("HOME");
             if (!home || !*home)
                 return {};
             std::filesystem::path desktop = std::filesystem::path(home) / "Desktop";
+#endif
 #ifdef __linux__
             // A localized desktop folder: XDG_DESKTOP_DIR="$HOME/Schreibtisch"
             // in user-dirs.dirs.
@@ -66,7 +84,11 @@ namespace report
                 }
 #endif
             std::error_code ec;
+#ifdef _WIN32
+            if (std::filesystem::is_directory(desktop, ec) && _waccess(desktop.c_str(), 2) == 0)
+#else
             if (std::filesystem::is_directory(desktop, ec) && access(desktop.c_str(), W_OK) == 0)
+#endif
                 return desktop;
             return {};
         }
@@ -123,8 +145,13 @@ namespace report
 
         time_t ModifiedTime(const std::filesystem::path& path)
         {
+#ifdef _WIN32
+            struct _stat64 st{};
+            return _wstat64(path.c_str(), &st) == 0 ? st.st_mtime : time(nullptr);
+#else
             struct stat st{};
             return stat(path.c_str(), &st) == 0 ? st.st_mtime : time(nullptr);
+#endif
         }
 
         // Halved (2x2 box filter) while wider than 2560: a 3440x1440 frame
@@ -308,7 +335,36 @@ namespace report
                 partial += ".partial";
                 std::error_code ec;
                 std::filesystem::create_directories(folder, ec);
-                // write(2) rather than a stream, for an errno that says why.
+                // Use a file descriptor rather than a stream, for a useful
+                // error when the archive couldn't be saved.
+#ifdef _WIN32
+                HANDLE file = CreateFileW(partial.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (file == INVALID_HANDLE_VALUE)
+                    return std::system_category().message(int(GetLastError()));
+                std::string failure;
+                for (size_t done = 0; done < archive.size();)
+                {
+                    DWORD written = 0;
+                    DWORD amount = DWORD(std::min<size_t>(archive.size() - done, MAXDWORD));
+                    if (!WriteFile(file, archive.data() + done, amount, &written, nullptr) || written == 0)
+                    {
+                        failure = std::system_category().message(int(GetLastError()));
+                        break;
+                    }
+                    done += written;
+                }
+                if (!CloseHandle(file) && failure.empty())
+                    failure = std::system_category().message(int(GetLastError()));
+                if (failure.empty() && !MoveFileExW(partial.c_str(), path.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                    failure = std::system_category().message(int(GetLastError()));
+                if (!failure.empty())
+                {
+                    DeleteFileW(partial.c_str());
+                    return failure;
+                }
+#else
                 int fd = ::open(partial.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
                 if (fd < 0)
                     return strerror(errno);
@@ -330,6 +386,7 @@ namespace report
                     std::filesystem::remove(partial, ec);
                     return strerror(error);
                 }
+#endif
                 return {};
             };
             std::filesystem::path folder = OutputFolder();
@@ -339,7 +396,7 @@ namespace report
             // no): the data folder, where the logs are, is ours.
             if (!failed.empty() && !std::getenv("NFSMW_BUG_REPORT_DIR") && folder != GetUserPath())
             {
-                fprintf(stderr, "[bugreport] couldn't save in %s (%s); trying the data folder\n", folder.c_str(), failed.c_str());
+                fprintf(stderr, "[bugreport] couldn't save in %s (%s); trying the data folder\n", folder.string().c_str(), failed.c_str());
                 std::filesystem::path fallback = GetUserPath();
                 std::filesystem::path fallbackPath = fallback / path.filename();
                 if (std::string again = saveTo(fallback, fallbackPath); again.empty())
@@ -361,7 +418,7 @@ namespace report
             double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             std::string size = archive.size() < (1 << 20) ? std::format("{} KB", (archive.size() + 1023) >> 10)
                                                           : std::format("{:.1f} MB", double(archive.size()) / (1 << 20));
-            fprintf(stderr, "[bugreport] saved %s (%zu files, %s, %.1f s)\n", path.c_str(), zip.Entries(), size.c_str(), seconds);
+            fprintf(stderr, "[bugreport] saved %s (%zu files, %s, %.1f s)\n", path.string().c_str(), zip.Entries(), size.c_str(), seconds);
             std::string where = Describe(path);
             SetMessage("Saved to " + where);
             s_state.store(BugReportState::Saved);

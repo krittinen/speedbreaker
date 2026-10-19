@@ -12,12 +12,19 @@
 #include "overlapped.h"
 #include <kernel/function.h>
 #include <fstream>
+#include <cerrno>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace
 {
     constexpr uint32_t XAM_ERROR_IO_PENDING = 0x3E5;
     constexpr uint32_t XAM_ERROR_ALREADY_EXISTS = 0xB7;
     constexpr uint32_t XAM_ERROR_FUNCTION_FAILED = 0x65B;
+    constexpr uint32_t XAM_ERROR_ACCESS_DENIED = 5;
+    constexpr uint32_t XAM_ERROR_WRITE_FAULT = 29;
 
     // Asynchronous XAM calls (Xenia's CompleteOverlappedImmediate): with an
     // XOVERLAPPED the result goes there, its event is signalled, and the
@@ -494,6 +501,71 @@ uint32_t XamContentDelete(uint32_t userIndex, const XCONTENT_DATA* data, XXOVERL
 
 uint32_t XamContentFlush(const char* rootName, XXOVERLAPPED* overlapped)
 {
+    std::string_view registered = rootName ? XamGetRootPath(rootName) : std::string_view{};
+    if (registered.empty())
+        return XamComplete(overlapped, ERROR_PATH_NOT_FOUND);
+
+    std::filesystem::path root(std::u8string_view(reinterpret_cast<const char8_t*>(registered.data()), registered.size()));
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(root, ec), end;
+    if (ec)
+    {
+        fprintf(stderr, "[xam] can't enumerate save content %s: %s\n", root.string().c_str(), ec.message().c_str());
+        return XamComplete(overlapped, ERROR_PATH_NOT_FOUND);
+    }
+    for (; it != end; it.increment(ec))
+    {
+        if (ec)
+            break;
+        if (!it->is_regular_file(ec))
+        {
+            if (ec)
+                break;
+            continue;
+        }
+#ifdef _WIN32
+        HANDLE file = CreateFileW(it->path().c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            DWORD error = GetLastError();
+            fprintf(stderr, "[xam] can't open save file for flushing %s (Windows error %lu)\n", it->path().string().c_str(),
+                static_cast<unsigned long>(error));
+            return XamComplete(overlapped, error == ERROR_ACCESS_DENIED ? XAM_ERROR_ACCESS_DENIED : XAM_ERROR_WRITE_FAULT);
+        }
+        BOOL flushed = FlushFileBuffers(file);
+        DWORD error = flushed ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(file);
+        if (!flushed)
+        {
+            fprintf(stderr, "[xam] can't flush save file %s (Windows error %lu)\n", it->path().string().c_str(),
+                static_cast<unsigned long>(error));
+            return XamComplete(overlapped, error == ERROR_ACCESS_DENIED ? XAM_ERROR_ACCESS_DENIED : XAM_ERROR_WRITE_FAULT);
+        }
+#else
+        int file = open(it->path().c_str(), O_WRONLY | O_CLOEXEC);
+        if (file < 0)
+        {
+            fprintf(stderr, "[xam] can't open save file for flushing %s: %s\n", it->path().string().c_str(), strerror(errno));
+            return XamComplete(overlapped, errno == EACCES ? XAM_ERROR_ACCESS_DENIED : XAM_ERROR_WRITE_FAULT);
+        }
+        int flushResult = fsync(file);
+        int flushError = errno;
+        int closeResult = close(file);
+        if (flushResult != 0 || closeResult != 0)
+        {
+            int error = flushResult != 0 ? flushError : errno;
+            fprintf(stderr, "[xam] can't flush save file %s: %s\n", it->path().string().c_str(), strerror(error));
+            return XamComplete(overlapped, error == EACCES ? XAM_ERROR_ACCESS_DENIED : XAM_ERROR_WRITE_FAULT);
+        }
+#endif
+    }
+    if (ec)
+    {
+        fprintf(stderr, "[xam] can't enumerate save content %s: %s\n", root.string().c_str(), ec.message().c_str());
+        return XamComplete(overlapped, XAM_ERROR_WRITE_FAULT);
+    }
+    fprintf(stderr, "[xam] flushed save content %s to storage\n", root.string().c_str());
     return XamComplete(overlapped, ERROR_SUCCESS);
 }
 

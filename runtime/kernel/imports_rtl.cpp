@@ -6,7 +6,7 @@
 #include <stdafx.h>
 #include "function.h"
 
-uint32_t RtlCompareMemory(const uint8_t* a, const uint8_t* b, uint32_t length)
+uint32_t X_RtlCompareMemory(const uint8_t* a, const uint8_t* b, uint32_t length)
 {
     uint32_t n = 0;
     while (n < length && a[n] == b[n])
@@ -88,7 +88,7 @@ uint32_t RtlTimeFieldsToTime(const XTIME_FIELDS* fields, be<int64_t>* time)
     return 1;
 }
 
-GUEST_FUNCTION_HOOK(__imp__RtlCompareMemory, RtlCompareMemory);
+GUEST_FUNCTION_HOOK(__imp__RtlCompareMemory, X_RtlCompareMemory);
 GUEST_FUNCTION_HOOK(__imp__RtlCompareMemoryUlong, RtlCompareMemoryUlong);
 GUEST_FUNCTION_HOOK(__imp__RtlFillMemoryUlong, RtlFillMemoryUlong);
 GUEST_FUNCTION_HOOK(__imp__RtlInitUnicodeString, RtlInitUnicodeString);

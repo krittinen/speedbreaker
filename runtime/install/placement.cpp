@@ -21,6 +21,9 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <atomic>
+#include <windows.h>
 #endif
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -307,21 +310,36 @@ namespace install
             struct stat self{}, above{};
             return stat(path.c_str(), &self) == 0 && stat(parent.c_str(), &above) == 0 && self.st_dev != above.st_dev;
 #else
-            (void)path;
-            (void)parent;
-            return false;
+            wchar_t self[MAX_PATH]{}, above[MAX_PATH]{};
+            if (!GetVolumePathNameW(path.c_str(), self, DWORD(std::size(self)))
+                || !GetVolumePathNameW(parent.c_str(), above, DWORD(std::size(above))))
+                return false;
+            return CompareStringOrdinal(self, -1, above, -1, TRUE) != CSTR_EQUAL;
 #endif
         }
 
-        // A new file or folder can be made in `folder`. (Windows: access()
-        // ignores ACLs there; CheckDestination is left to tell.)
+        // A new file or folder can be made in `folder`.
         bool CanWrite(const fs::path& folder)
         {
 #ifndef _WIN32
             return access(folder.c_str(), W_OK | X_OK) == 0;
 #else
-            (void)folder;
-            return true;
+            static std::atomic<uint32_t> sequence{ 0 };
+            for (unsigned attempt = 0; attempt < 8; attempt++)
+            {
+                fs::path probe = folder / std::format(".speedbreaker-write-test-{}-{}.tmp",
+                    GetCurrentProcessId(), sequence.fetch_add(1, std::memory_order_relaxed));
+                HANDLE file = CreateFileW(probe.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+                if (file != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(file);
+                    return true;
+                }
+                if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS)
+                    return false;
+            }
+            return false;
 #endif
         }
 
@@ -401,8 +419,19 @@ namespace install
         std::string FileSystemOf(const fs::path& path)
         {
 #if defined(_WIN32)
-            (void)path;
-            return {};
+            wchar_t root[MAX_PATH]{}, name[MAX_PATH]{};
+            DWORD serial = 0, maxComponent = 0, flags = 0;
+            if (!GetVolumePathNameW(path.c_str(), root, DWORD(std::size(root)))
+                || !GetVolumeInformationW(root, name, DWORD(std::size(name)), &serial, &maxComponent, &flags,
+                    nullptr, 0))
+                return {};
+            int bytes = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr);
+            if (bytes <= 1)
+                return {};
+            std::string result(size_t(bytes), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, name, -1, result.data(), bytes, nullptr, nullptr);
+            result.resize(size_t(bytes - 1));
+            return result;
 #elif defined(__APPLE__)
             struct statfs sfs{};
             if (statfs(path.c_str(), &sfs) != 0)

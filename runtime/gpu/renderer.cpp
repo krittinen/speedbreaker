@@ -41,9 +41,19 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 #include <memory>
 #include <unordered_map>
 
@@ -52,6 +62,21 @@ namespace gpu::renderer
     namespace
     {
         using namespace xe::gpu;
+
+        FILE* OpenPathFile(const std::filesystem::path& path, const char* mode)
+        {
+#ifdef _WIN32
+            wchar_t wideMode[8]{};
+            size_t i = 0;
+            for (; mode[i] && i + 1 < std::size(wideMode); i++)
+                wideMode[i] = wchar_t(mode[i]);
+            if (mode[i])
+                return nullptr;
+            return _wfopen(path.c_str(), wideMode);
+#else
+            return fopen(path.c_str(), mode);
+#endif
+        }
 
         const video::VulkanContext* s_vk = nullptr;
         VkDevice s_dev = VK_NULL_HANDLE;
@@ -1432,7 +1457,7 @@ namespace gpu::renderer
             if (!s_shaderCacheEnabled)
                 return CompileGlslUncached(source, stage, log, preamble);
             std::filesystem::path file = ShaderCacheFile(source, stage, preamble);
-            if (FILE* f = fopen(file.c_str(), "rb"))
+            if (FILE* f = OpenPathFile(file, "rb"))
             {
                 std::vector<uint32_t> spirv;
                 fseek(f, 0, SEEK_END);
@@ -1459,7 +1484,7 @@ namespace gpu::renderer
                 // Unique per thread: two workers may compile the same source.
                 std::filesystem::path temp = file;
                 temp += std::format(".{}.tmp", std::hash<std::thread::id>{}(std::this_thread::get_id()));
-                if (FILE* f = fopen(temp.c_str(), "wb"))
+                if (FILE* f = OpenPathFile(temp, "wb"))
                 {
                     bool ok = fwrite(spirv.data(), 4, spirv.size(), f) == spirv.size();
                     ok = fclose(f) == 0 && ok;
@@ -1524,7 +1549,7 @@ namespace gpu::renderer
         {
             std::vector<uint8_t> data;
             if (s_shaderCacheEnabled)
-                if (FILE* f = fopen((GetCachePath() / "pipelines.bin").c_str(), "rb"))
+                if (FILE* f = OpenPathFile(GetCachePath() / "pipelines.bin", "rb"))
                 {
                     fseek(f, 0, SEEK_END);
                     long size = ftell(f);
@@ -1598,7 +1623,7 @@ namespace gpu::renderer
             std::filesystem::create_directories(GetCachePath(), ec);
             std::filesystem::path file = GetCachePath() / "pipelines.bin", temp = file;
             temp += ".tmp";
-            if (FILE* f = fopen(temp.c_str(), "wb"))
+            if (FILE* f = OpenPathFile(temp, "wb"))
             {
                 bool ok = fwrite(data.data(), 1, size, f) == size;
                 ok = fclose(f) == 0 && ok;
@@ -5814,7 +5839,13 @@ void main()
             s_scaled.pageSeq.assign(kGuestPages, 0);
             s_scaled.slotPage.assign(s_scaled.slots, 0);
             s_scaled.slotRef.assign(s_scaled.slots, 0);
+#ifdef _WIN32
+            SYSTEM_INFO hostSystem{};
+            GetSystemInfo(&hostSystem);
+            long hostPage = long(hostSystem.dwPageSize);
+#else
             long hostPage = sysconf(_SC_PAGESIZE);
+#endif
             s_scaled.hostPageGuestPages = hostPage > 4096 ? uint32_t(hostPage / 4096) : 1;
             // The pipelines take the scale in their push constants: made
             // once, kept when the memory is made again at another scale.
@@ -9307,9 +9338,22 @@ void main()
         // This (the command processor's) thread's CPU time, and on Linux the
         // times the scheduler took its core away: busy time the thread wasn't
         // on a core is time it was descheduled, not work.
+#ifdef _WIN32
+        FILETIME creation{}, exit{}, kernel{}, user{};
+        if (GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user))
+        {
+            ULARGE_INTEGER kernelTime{}, userTime{};
+            kernelTime.LowPart = kernel.dwLowDateTime;
+            kernelTime.HighPart = kernel.dwHighDateTime;
+            userTime.LowPart = user.dwLowDateTime;
+            userTime.HighPart = user.dwHighDateTime;
+            now.cpuNs = (kernelTime.QuadPart + userTime.QuadPart) * 100;
+        }
+#else
         struct timespec cpu{};
         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
         now.cpuNs = uint64_t(cpu.tv_sec) * 1000000000ull + uint64_t(cpu.tv_nsec);
+#endif
 #ifdef RUSAGE_THREAD
         struct rusage usage{};
         getrusage(RUSAGE_THREAD, &usage);

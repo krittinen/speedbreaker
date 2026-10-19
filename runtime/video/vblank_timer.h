@@ -11,9 +11,10 @@
 // mach_wait_until didn't help either: what does is real-time scheduling, the
 // time-constraint policy Core Audio's threads run under, which the thread now
 // asks for (0.01 ms late at the median, 0.02 in 99%). NFSMW_VBLANK_TIMER=sleep
-// keeps the ordinary thread (an A/B switch). Elsewhere nothing changes: on the
-// Steam Machine (Linux's high-resolution timers) the vblanks were already
-// within 0.06 ms of their time.
+// keeps the ordinary thread (an A/B switch). Windows uses a high-resolution
+// waitable timer: ordinary sleep wakeups were late by several milliseconds.
+// Elsewhere nothing changes: on the Steam Machine (Linux's high-resolution
+// timers) the vblanks were already within 0.06 ms of their time.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -24,16 +25,18 @@ namespace video
     enum class VblankTimer
     {
         Ordinary,  // the thread as created
-        RealTime,  // macOS: the time-constraint policy; elsewhere (iOS too) Ordinary
+        RealTime,  // macOS: time-constraint policy; Windows: high-resolution timer
     };
 
     // NFSMW_VBLANK_TIMER=sleep: Ordinary; otherwise RealTime.
     VblankTimer ChosenVblankTimer();
     // The calling thread, once, before its first sleep: its scheduling for
-    // vblanks `periodNs` apart. True: real-time scheduling was granted.
+    // vblanks `periodNs` apart. True: the platform's preferred timer was set up.
     bool PrepareVblankThread(VblankTimer timer, int64_t periodNs);
-    // For the log: "real-time", "ordinary (NFSMW_VBLANK_TIMER=sleep)",
-    // "ordinary (real-time refused)" or, off macOS, "ordinary".
+    // Wait for an absolute steady-clock deadline in nanoseconds.
+    void WaitVblankUntil(VblankTimer timer, int64_t deadlineNs);
+    // For the log: "real-time", "high-resolution waitable timer",
+    // "ordinary (NFSMW_VBLANK_TIMER=sleep)", or a platform fallback.
     const char* VblankTimerName(VblankTimer timer, bool realtime);
 
     // The last minute of vblanks: how late each fired after its time (the

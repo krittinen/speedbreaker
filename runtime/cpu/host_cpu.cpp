@@ -123,6 +123,9 @@ namespace hostcpu
         s_reserving = true;
         fprintf(stderr, "[cpu] command processor: cpus %s (a %score of its own); other threads: cpus %s\n",
             CpuList(s_reserved).c_str(), split ? "fast " : "", CpuList(s_shared).c_str());
+#elif defined(_WIN32)
+        // Leave placement to the Windows scheduler; the reservation heuristic
+        // above depends on Linux affinity masks and per-CPU sysfs data.
 #endif
     }
 
@@ -131,6 +134,8 @@ namespace hostcpu
 #ifdef __linux__
         if (s_reserving && sched_setaffinity(0, sizeof(s_reserved), &s_reserved) != 0)
             fprintf(stderr, "[cpu] %s: could not move to its reserved core\n", who);
+#elif defined(_WIN32)
+        (void)who;
 #else
         (void)who;
 #endif
@@ -141,6 +146,8 @@ namespace hostcpu
 #ifdef __linux__
         if (s_reserving)
             sched_setaffinity(0, sizeof(s_shared), &s_shared);
+#elif defined(_WIN32)
+        // No process-wide affinity change was made by ReserveFastCore.
 #endif
     }
 
@@ -153,6 +160,8 @@ namespace hostcpu
             prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
             done = true;
         }
+#elif defined(_WIN32)
+        // Linux timer slack has no safe per-thread Windows equivalent.
 #endif
     }
 }

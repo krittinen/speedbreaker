@@ -690,6 +690,11 @@ tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/nfsmw.toml tools/XenonRec
 cmake -S . -B build/main -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
+# Windows (MSYS2 UCRT64)
+cmake -S . -B build/main -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+# CMake copies the required runtime DLLs beside SpeedBreaker.exe.
+
 # Mac (Homebrew's LLVM): the libraries for macOS 15, as the release (a few minutes; it downloads
 # their source archives and checks each one's SHA-256), then the game against them
 scripts/macos/build_deps.sh build/deps

@@ -9,8 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <iterator>
 #include <set>
 
+#ifndef _WIN32
 #include <pwd.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -18,6 +20,11 @@
 #include <sys/mount.h>
 #endif
 #include <unistd.h>
+#else
+#include <io.h>
+#include <windows.h>
+#include <cwchar>
+#endif
 
 namespace install
 {
@@ -31,16 +38,34 @@ namespace install
             return !name.empty() && name[0] == '.';
         }
 
-#ifndef __APPLE__
+#if !defined(__APPLE__)
         std::string UserName()
         {
+#ifdef _WIN32
+            if (const char* user = std::getenv("USERNAME"); user && *user)
+                return user;
+#else
             if (const char* user = std::getenv("USER"); user && *user)
                 return user;
             if (const passwd* pw = getpwuid(getuid()))
                 return pw->pw_name;
+#endif
             return {};
         }
 #endif
+
+        fs::path UserHome()
+        {
+#ifdef _WIN32
+            wchar_t profile[32768]{};
+            DWORD length = GetEnvironmentVariableW(L"USERPROFILE", profile, DWORD(std::size(profile)));
+            if (length && length < std::size(profile))
+                return fs::path(profile);
+#endif
+            if (const char* home = std::getenv("HOME"); home && *home)
+                return fs::path(home);
+            return {};
+        }
 
         // default.xex in `dir` with the manifest's size (and, if asked, the
         // current marker beside it), as spelled on disk.
@@ -164,7 +189,7 @@ namespace install
         {
             std::optional<std::string> marker = ReadInstallMarker(user);
             fprintf(stderr, "[install] %s is not a current install (marker %s, manifest %.*s): reinstall\n",
-                user.c_str(), marker ? marker->c_str() : "missing", int(manifest.version.size()), manifest.version.data());
+                user.string().c_str(), marker ? marker->c_str() : "missing", int(manifest.version.size()), manifest.version.data());
         }
         return std::nullopt;
     }
@@ -173,22 +198,43 @@ namespace install
     {
         fs::path LocationFile()
         {
+            if (portable::Current().Active())
+                return GetUserPath() / "game-location";
+#ifdef _WIN32
+            wchar_t localAppData[32768]{};
+            DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, DWORD(std::size(localAppData)));
+            if (length && length < std::size(localAppData))
+                return fs::path(localAppData) / kUserFolderName / "game-location";
+            fs::path home = UserHome();
+            if (!home.empty())
+                return home / "AppData/Local" / kUserFolderName / "game-location";
+#endif
             return GetUserPath() / "game-location";
         }
 
         // A folder that is the root of a mounted file system.
         bool IsMountPoint(const fs::path& dir)
         {
+#ifdef _WIN32
+            wchar_t root[MAX_PATH]{};
+            return GetVolumePathNameW(dir.c_str(), root, DWORD(std::size(root)))
+                && fs::path(root).lexically_normal() == dir.lexically_normal();
+#else
             struct stat self{}, parent{};
             if (stat(dir.c_str(), &self) != 0 || stat(dir.parent_path().c_str(), &parent) != 0)
                 return false;
             return S_ISDIR(self.st_mode) && self.st_dev != parent.st_dev;
+#endif
         }
     }
 
     std::optional<std::filesystem::path> ReadInstallRecord(const std::filesystem::path& file, const portable::Layout& layout)
     {
+#ifdef _WIN32
+        FILE* f = _wfopen(file.c_str(), L"rb");
+#else
         FILE* f = fopen(file.c_str(), "rb");
+#endif
         if (!f)
             return std::nullopt;
         char buffer[4096];
@@ -205,16 +251,32 @@ namespace install
         fs::create_directories(file.parent_path(), ec);
         fs::path temp = file;
         temp += ".tmp";
+#ifdef _WIN32
+        FILE* f = _wfopen(temp.c_str(), L"wb");
+#else
         FILE* f = fopen(temp.c_str(), "wb");
+#endif
         if (!f)
             return false;
         std::string line = text + "\n";
         bool ok = fwrite(line.data(), 1, line.size(), f) == line.size();
         ok = fflush(f) == 0 && ok;
+#ifdef _WIN32
+        if (ok)
+            ok = FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(f)))) != 0;
+#else
         fsync(fileno(f));
+#endif
         fclose(f);
         if (ok)
+#ifdef _WIN32
+        {
+            if (!MoveFileExW(temp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                ec = std::error_code(int(GetLastError()), std::system_category());
+        }
+#else
             fs::rename(temp, file, ec);
+#endif
         return ok && !ec;
     }
 
@@ -256,6 +318,15 @@ namespace install
         {
             if (Hidden(volume) || !IsMountPoint(volume))
                 return;
+#ifdef _WIN32
+            wchar_t root[MAX_PATH]{}, fileSystem[MAX_PATH]{}, volumeName[MAX_PATH]{};
+            DWORD serial = 0, maxComponent = 0, flags = 0;
+            if (!GetVolumePathNameW(volume.c_str(), root, DWORD(std::size(root)))
+                || !GetVolumeInformationW(root, volumeName, DWORD(std::size(volumeName)), &serial, &maxComponent,
+                    &flags, fileSystem, DWORD(std::size(fileSystem)))
+                || (flags & FILE_READ_ONLY_VOLUME))
+                return;
+#else
             // Not read-only drives (a disc), nor the system's hidden volumes
             // (macOS Recovery, Preboot, VM).
             struct statvfs vfs{};
@@ -266,7 +337,28 @@ namespace install
             if (statfs(volume.c_str(), &sfs) != 0 || (sfs.f_flags & MNT_DONTBROWSE))
                 return;
 #endif
+#endif
+#ifdef _WIN32
+            std::string label;
+            if (*volumeName)
+            {
+                int bytes = WideCharToMultiByte(CP_UTF8, 0, volumeName, -1, nullptr, 0, nullptr, nullptr);
+                if (bytes > 1)
+                {
+                    label.resize(size_t(bytes));
+                    WideCharToMultiByte(CP_UTF8, 0, volumeName, -1, label.data(), bytes, nullptr, nullptr);
+                    label.resize(size_t(bytes - 1));
+                }
+            }
+#else
             std::string label = volume.filename().string();
+#endif
+#ifdef _WIN32
+            if (label.empty())
+                label = volume.filename().string();
+            if (label.empty())
+                label = volume.string();
+#endif
             out.push_back({ label.empty() ? volume.string() : label, volume / kUserFolderName / "game", true });
         };
         std::error_code ec;
@@ -276,6 +368,18 @@ namespace install
             std::error_code sameEc;
             if (!fs::equivalent(it->path(), "/", sameEc))
                 addVolume(it->path());
+        }
+#elif defined(_WIN32)
+        wchar_t drives[512]{};
+        DWORD count = GetLogicalDriveStringsW(DWORD(std::size(drives)), drives);
+        if (count && count < std::size(drives))
+        {
+            for (const wchar_t* root = drives; *root; root += wcslen(root) + 1)
+            {
+                UINT type = GetDriveTypeW(root);
+                if (type == DRIVE_REMOVABLE || type == DRIVE_FIXED || type == DRIVE_REMOTE)
+                    addVolume(fs::path(root));
+            }
         }
 #else
         std::string user = UserName();
@@ -301,12 +405,11 @@ namespace install
             if (fs::is_directory(dir, ec) && std::find(folders.begin(), folders.end(), dir) == folders.end())
                 folders.push_back(dir);
         };
-        if (const char* home = std::getenv("HOME"); home && *home)
+        if (fs::path home = UserHome(); !home.empty())
         {
-            fs::path h = home;
-            add(h);
+            add(home);
             for (const char* sub : { "Downloads", "Desktop", "Documents", "Games" })
-                add(h / sub);
+                add(home / sub);
         }
 #ifdef __APPLE__
         // /Volumes also lists the startup disk (a link to /): skip it, a scan of

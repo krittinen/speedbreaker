@@ -27,8 +27,8 @@ static_assert(settings::keynames::Code("a") == SDL_SCANCODE_A && settings::keyna
 
 namespace
 {
-    constexpr uint32_t ERROR_SUCCESS = 0;
-    constexpr uint32_t ERROR_DEVICE_NOT_CONNECTED = 0x48F;
+    constexpr uint32_t kErrorSuccess = 0;
+    constexpr uint32_t kErrorDeviceNotConnected = 0x48F;
 
     struct Pad
     {
@@ -798,13 +798,13 @@ namespace
     };
     static_assert(sizeof(Keystroke) == 8);
 
-    constexpr uint32_t ERROR_EMPTY = 0x10D2;
+    constexpr uint32_t kErrorEmpty = 0x10D2;
 
     uint32_t NextKeystroke(Keystroke* out)
     {
         std::lock_guard lock(s_mutex);
         if (!(s_deviceConnected || !s_script.empty()))
-            return ERROR_DEVICE_NOT_CONNECTED;
+            return kErrorDeviceNotConnected;
         Pad p = CurrentPadLocked();
         int64_t now = guesttime::NowNs();
         auto emit = [&](size_t i, uint16_t flags) {
@@ -813,7 +813,7 @@ namespace
             out->flags = flags;
             out->userIndex = 0;
             out->hidCode = 0;
-            return ERROR_SUCCESS;
+            return kErrorSuccess;
         };
         for (size_t i = 0; i < kKeyCount; i++)
         {
@@ -831,7 +831,7 @@ namespace
                 s_keyRepeatAt[i] = now + 100'000'000;
                 return emit(i, 1 | 4);
             }
-        return ERROR_EMPTY;
+        return kErrorEmpty;
     }
 }
 
@@ -841,7 +841,7 @@ uint32_t XamInputGetCapabilities(uint32_t userIndex, uint32_t flags, XAMINPUT_CA
     {
         std::lock_guard lock(s_mutex);
         if ((userIndex != 0 && userIndex != 0xFF) || !(s_deviceConnected || scripted))
-            return ERROR_DEVICE_NOT_CONNECTED;
+            return kErrorDeviceNotConnected;
     }
     memset(caps, 0, sizeof(*caps));
     caps->Type = XAMINPUT_DEVTYPE_GAMEPAD;
@@ -853,7 +853,7 @@ uint32_t XamInputGetCapabilities(uint32_t userIndex, uint32_t flags, XAMINPUT_CA
         *v = ByteSwap(int16_t(0xFFC0));
     caps->Vibration.wLeftMotorSpeed = 0xFFFF;
     caps->Vibration.wRightMotorSpeed = 0xFFFF;
-    return ERROR_SUCCESS;
+    return kErrorSuccess;
 }
 
 uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* state)
@@ -863,7 +863,7 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
     {
         std::lock_guard lock(s_mutex);
         if ((userIndex != 0 && userIndex != 0xFF) || !(s_deviceConnected || !s_script.empty()))
-            return ERROR_DEVICE_NOT_CONNECTED;
+            return kErrorDeviceNotConnected;
         p = CurrentPadLocked();
         static Pad last;
         if (memcmp(&p, &last, sizeof(p)) != 0)
@@ -881,18 +881,18 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
     state->Gamepad.sThumbLY = ByteSwap(p.ly);
     state->Gamepad.sThumbRX = ByteSwap(p.rx);
     state->Gamepad.sThumbRY = ByteSwap(p.ry);
-    return ERROR_SUCCESS;
+    return kErrorSuccess;
 }
 
 uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION* vibration)
 {
     std::lock_guard lock(s_mutex);
     if ((userIndex != 0 && userIndex != 0xFF) || !(s_deviceConnected || !s_script.empty()))
-        return ERROR_DEVICE_NOT_CONNECTED;
+        return kErrorDeviceNotConnected;
     s_rumbleLow = ByteSwap(vibration->wLeftMotorSpeed);
     s_rumbleHigh = ByteSwap(vibration->wRightMotorSpeed);
     s_rumbleDirty = true;
-    return ERROR_SUCCESS;
+    return kErrorSuccess;
 }
 
 // Xenia's semantics: user 0xFF ("any") is pinned to user 0; queries for
@@ -902,16 +902,16 @@ uint32_t XamInputGetKeystroke(uint32_t userIndex, uint32_t flags, Keystroke* key
     if (!keystroke)
         return 0xA0;  // ERROR_BAD_ARGUMENTS
     if ((flags & 0xFF) && (flags & 1) == 0)
-        return ERROR_DEVICE_NOT_CONNECTED;
+        return kErrorDeviceNotConnected;
     if ((userIndex & 0xFF) != 0xFF && userIndex != 0 && !(flags & 0x40000000))
-        return ERROR_DEVICE_NOT_CONNECTED;
+        return kErrorDeviceNotConnected;
     return NextKeystroke(keystroke);
 }
 
 uint32_t XamInputGetKeystrokeEx(be<uint32_t>* userIndex, uint32_t flags, Keystroke* keystroke)
 {
     uint32_t result = XamInputGetKeystroke(userIndex ? uint32_t(*userIndex) : 0xFF, flags, keystroke);
-    if (result == ERROR_SUCCESS && userIndex)
+    if (result == kErrorSuccess && userIndex)
         *userIndex = 0;
     return result;
 }

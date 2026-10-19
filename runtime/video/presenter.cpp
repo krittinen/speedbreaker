@@ -3323,7 +3323,11 @@ void main()
             ui::ProcessEvent(e);
             hid::HandleEvent(e);
             if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED)
+            {
+                fprintf(stderr, "[runtime] received %s event; leaving the frame loop\n",
+                    e.type == SDL_EVENT_QUIT ? "SDL_QUIT" : "window close");
                 return false;
+            }
             if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_WINDOW_RESIZED ||
                 e.type == SDL_EVENT_WINDOW_METAL_VIEW_RESIZED || e.type == SDL_EVENT_DISPLAY_ORIENTATION)
             {

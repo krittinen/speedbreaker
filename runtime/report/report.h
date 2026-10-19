@@ -33,7 +33,11 @@
 #include <filesystem>
 #include <string>
 
+#ifdef _WIN32
+struct _EXCEPTION_POINTERS;
+#else
 #include <signal.h>
+#endif
 
 struct PPCContext;
 
@@ -97,7 +101,11 @@ namespace report
     void PrepareCrashReports();
     // The crash handler (a signal handler; async-signal-safe): logs the
     // crash and writes the report. The caller exits afterwards.
+#ifdef _WIN32
+    void WriteCrashReport(_EXCEPTION_POINTERS* exception);
+#else
     void WriteCrashReport(int sig, siginfo_t* info, void* context);
+#endif
     // The session is ending cleanly (the quit path, any return from main()):
     // its crash marker is removed (crash_marker.h), so one the next launch
     // finds is a session that didn't. Last, just before the exit: a crash

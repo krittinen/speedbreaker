@@ -17,9 +17,13 @@ namespace vmem
         size_t bytes = size_t(count) * m_pageSize;
         // Physical memory is a shared object mirrored at three windows:
         // remapping would break the aliasing, so zero it in place.
+#ifdef _WIN32
+        memset(host, 0, bytes);
+#else
         if (m_base >= 0xA0000000 ||
             mmap(host, bytes, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) == MAP_FAILED)
             memset(host, 0, bytes);
+#endif
     }
 
     uint32_t PageHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t type, uint32_t protect, bool topDown,

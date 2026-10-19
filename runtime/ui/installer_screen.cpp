@@ -406,7 +406,8 @@ namespace ui
                         if (job->abandoned)
                         {
                             release = std::exchange(job->access, 0);
-                            fprintf(stderr, "[installer] the check of %s that was left behind has returned\n", path.c_str());
+                            fprintf(stderr, "[installer] the check of %s that was left behind has returned\n",
+                                path.string().c_str());
                         }
                         else
                         {
@@ -733,7 +734,7 @@ namespace ui
                 {
                     check->abandoned = true;
                     check->access = std::exchange(access, 0);
-                    fprintf(stderr, "[installer] left the check of %s still reading\n", sourcePath.c_str());
+                    fprintf(stderr, "[installer] left the check of %s still reading\n", sourcePath.string().c_str());
                 }
             }
             check.reset();
@@ -845,7 +846,7 @@ namespace ui
                 installedPath = st.destination;
                 // So the next launch finds it (internal storage clears the record).
                 if (!install::RecordInstallPath(st.destination))
-                    fprintf(stderr, "[installer] couldn't record the install location %s\n", st.destination.c_str());
+                    fprintf(stderr, "[installer] couldn't record the install location %s\n", st.destination.string().c_str());
                 st.Go(Page::Done);
             }
             else if (st.result.error == install::Error::Cancelled)

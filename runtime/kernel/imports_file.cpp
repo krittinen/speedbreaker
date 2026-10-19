@@ -13,12 +13,95 @@
 #include "function.h"
 #include "vfs.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace
 {
+#ifdef _WIN32
+    using HostFile = HANDLE;
+    const HostFile kInvalidHostFile = INVALID_HANDLE_VALUE;
+
+    int ErrnoFromWin32(DWORD error)
+    {
+        switch (error)
+        {
+        case ERROR_ACCESS_DENIED: return EACCES;
+        case ERROR_DISK_FULL: return ENOSPC;
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND: return ENOENT;
+        case ERROR_INVALID_HANDLE: return EBADF;
+        default: return EIO;
+        }
+    }
+
+    int64_t ReadAt(HostFile file, void* buffer, uint32_t length, uint64_t offset)
+    {
+        OVERLAPPED overlapped{};
+        overlapped.Offset = DWORD(offset);
+        overlapped.OffsetHigh = DWORD(offset >> 32);
+        DWORD read = 0;
+        BOOL ok = ReadFile(file, buffer, length, &read, &overlapped);
+        if (!ok && GetLastError() == ERROR_IO_PENDING)
+            ok = GetOverlappedResult(file, &overlapped, &read, TRUE);
+        if (!ok)
+        {
+            DWORD error = GetLastError();
+            if (error == ERROR_HANDLE_EOF)
+                return 0;
+            errno = ErrnoFromWin32(error);
+            return -1;
+        }
+        return read;
+    }
+
+    int64_t WriteAt(HostFile file, const void* buffer, uint32_t length, uint64_t offset)
+    {
+        OVERLAPPED overlapped{};
+        overlapped.Offset = DWORD(offset);
+        overlapped.OffsetHigh = DWORD(offset >> 32);
+        DWORD written = 0;
+        BOOL ok = WriteFile(file, buffer, length, &written, &overlapped);
+        if (!ok && GetLastError() == ERROR_IO_PENDING)
+            ok = GetOverlappedResult(file, &overlapped, &written, TRUE);
+        if (!ok)
+        {
+            errno = ErrnoFromWin32(GetLastError());
+            return -1;
+        }
+        return written;
+    }
+
+    bool TruncateFile(HostFile file, uint64_t size)
+    {
+        FILE_END_OF_FILE_INFO info{};
+        info.EndOfFile.QuadPart = LONGLONG(size);
+        if (SetFileInformationByHandle(file, FileEndOfFileInfo, &info, sizeof(info)))
+            return true;
+        errno = ErrnoFromWin32(GetLastError());
+        return false;
+    }
+
+    HostFile OpenHostFile(const std::filesystem::path& path, bool write, bool create, bool truncate)
+    {
+        DWORD access = write || create || truncate ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ;
+        DWORD disposition = truncate ? TRUNCATE_EXISTING : create ? OPEN_ALWAYS : OPEN_EXISTING;
+        HANDLE file = CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, disposition, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            errno = ErrnoFromWin32(GetLastError());
+        return file;
+    }
+#else
+    using HostFile = int;
+    constexpr HostFile kInvalidHostFile = -1;
+#endif
+
     constexpr uint32_t STATUS_NO_MORE_FILES = 0x80000006;
     constexpr uint32_t STATUS_BUFFER_OVERFLOW_ = 0x80000005;
     constexpr uint32_t STATUS_INVALID_INFO_CLASS = 0xC0000003;
@@ -28,6 +111,26 @@ namespace
     constexpr uint32_t STATUS_NOT_A_DIRECTORY = 0xC0000103;
 
     // Creation dispositions.
+#ifdef _WIN32
+#undef FILE_SUPERSEDE
+#undef FILE_OPEN
+#undef FILE_CREATE
+#undef FILE_OPEN_IF
+#undef FILE_OVERWRITE
+#undef FILE_OVERWRITE_IF
+#undef FILE_SUPERSEDED
+#undef FILE_OPENED
+#undef FILE_CREATED
+#undef FILE_OVERWRITTEN
+#undef FILE_EXISTS
+#undef FILE_DOES_NOT_EXIST
+#undef FILE_DIRECTORY_FILE
+#undef FILE_SYNCHRONOUS_IO_ALERT
+#undef FILE_SYNCHRONOUS_IO_NONALERT
+#undef FILE_NON_DIRECTORY_FILE
+#undef FILE_WRITE_DATA
+#undef FILE_APPEND_DATA
+#endif
     enum : uint32_t { FILE_SUPERSEDE, FILE_OPEN, FILE_CREATE, FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF };
     // IO_STATUS_BLOCK.Information after a create.
     enum : uint32_t { FILE_SUPERSEDED, FILE_OPENED, FILE_CREATED, FILE_OVERWRITTEN, FILE_EXISTS, FILE_DOES_NOT_EXIST };
@@ -56,6 +159,19 @@ namespace
 
     std::optional<HostAttributes> Stat(const std::filesystem::path& path, bool readOnly)
     {
+#ifdef _WIN32
+        WIN32_FILE_ATTRIBUTE_DATA data{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+            return std::nullopt;
+        HostAttributes a;
+        bool dir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        a.size = dir ? 0 : (uint64_t(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+        a.writeTime = (uint64_t(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
+        a.attributes = dir ? ATTR_DIRECTORY : ATTR_NORMAL;
+        if (readOnly || (data.dwFileAttributes & FILE_ATTRIBUTE_READONLY))
+            a.attributes |= ATTR_READONLY;
+        return a;
+#else
         struct stat st;
         if (stat(path.c_str(), &st) != 0)
             return std::nullopt;
@@ -72,6 +188,7 @@ namespace
         if (readOnly)
             a.attributes |= ATTR_READONLY;
         return a;
+#endif
     }
 
     uint64_t AllocationSize(uint64_t size)
@@ -113,7 +230,7 @@ static_assert(offsetof(X_FILE_DIRECTORY_INFORMATION, fileName) == 0x40);
 // returns, so waiting on the file handle never blocks.
 struct FileObject final : Waitable
 {
-    int fd = -1;
+    HostFile fd = kInvalidHostFile;
     std::filesystem::path path;
     std::string guestPath;
     bool readOnly = false;
@@ -127,8 +244,12 @@ struct FileObject final : Waitable
 
     ~FileObject() override
     {
-        if (fd >= 0)
+        if (fd != kInvalidHostFile)
+#ifdef _WIN32
+            CloseHandle(fd);
+#else
             close(fd);
+#endif
     }
 
     bool IsSignaledLocked() const override { return true; }
@@ -269,19 +390,29 @@ uint32_t NtCreateFile(be<uint32_t>* handleOut, uint32_t desiredAccess, XOBJECT_A
     }
     else
     {
-        int flags = wantsWrite ? O_RDWR : O_RDONLY;
+        bool create = false;
+        bool truncate = false;
         if (!exists)
         {
-            flags |= O_CREAT;
+            create = true;
             action = FILE_CREATED;
         }
         else if (disposition == FILE_SUPERSEDE || disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF)
         {
-            flags |= O_TRUNC | O_RDWR;
+            truncate = true;
             action = disposition == FILE_SUPERSEDE ? FILE_SUPERSEDED : FILE_OVERWRITTEN;
         }
+#ifdef _WIN32
+        file->fd = OpenHostFile(resolved->host, wantsWrite, create, truncate);
+#else
+        int flags = wantsWrite ? O_RDWR : O_RDONLY;
+        if (create)
+            flags |= O_CREAT;
+        if (truncate)
+            flags |= O_TRUNC | O_RDWR;
         file->fd = open(resolved->host.c_str(), flags, 0644);
-        if (file->fd < 0)
+#endif
+        if (file->fd == kInvalidHostFile)
         {
             DestroyKernelObject(file);
             return fail(STATUS_ACCESS_DENIED, 0);
@@ -289,7 +420,7 @@ uint32_t NtCreateFile(be<uint32_t>* handleOut, uint32_t desiredAccess, XOBJECT_A
     }
 
     *handleOut = GetKernelHandle(file);
-    fprintf(stderr, "[file] open \"%s\" -> %s%s\n", guestPath->c_str(), resolved->host.c_str(),
+    fprintf(stderr, "[file] open \"%s\" -> %s%s\n", guestPath->c_str(), resolved->host.string().c_str(),
         action == FILE_CREATED ? " (created)" : "");
     Complete(iosb, STATUS_SUCCESS, action);
     return STATUS_SUCCESS;
@@ -325,10 +456,15 @@ uint32_t NtReadFile(uint32_t fileHandle, uint32_t eventHandle, uint32_t apcRouti
     // game treats a failed read as fatal: its error callback is null, a crash
     // at lr 82621950.)
     uint8_t* dst = static_cast<uint8_t*>(buffer);
-    ssize_t n = 0;
+    int64_t n = 0;
     while (uint32_t(n) < length)
     {
+#ifdef _WIN32
+        int64_t got = ReadAt(file->fd, dst + n, length - uint32_t(n), pos + uint64_t(n));
+#else
         ssize_t got = pread(file->fd, dst + n, length - uint32_t(n), off_t(pos + uint64_t(n)));
+#endif
+#ifndef _WIN32
         if (got < 0 && errno == EFAULT)
         {
             static thread_local std::vector<uint8_t> bounce;
@@ -339,6 +475,7 @@ uint32_t NtReadFile(uint32_t fileHandle, uint32_t eventHandle, uint32_t apcRouti
             if (got > 0)
                 memcpy(dst + n, bounce.data(), size_t(got));
         }
+#endif
         if (got < 0 && errno == EINTR)
             continue;
         if (got < 0)
@@ -381,7 +518,11 @@ uint32_t NtWriteFile(uint32_t fileHandle, uint32_t eventHandle, uint32_t apcRout
 
     int64_t offset = byteOffset ? int64_t(*byteOffset) : -1;
     uint64_t pos = offset >= 0 ? uint64_t(offset) : file->position;
+#ifdef _WIN32
+    int64_t n = WriteAt(file->fd, buffer, length, pos);
+#else
     ssize_t n = pwrite(file->fd, buffer, length, off_t(pos));
+#endif
     if (n < 0)
     {
         Complete(iosb, STATUS_UNSUCCESSFUL, 0);
@@ -395,10 +536,32 @@ uint32_t NtWriteFile(uint32_t fileHandle, uint32_t eventHandle, uint32_t apcRout
 
 uint32_t NtFlushBuffersFile(uint32_t fileHandle, XIO_STATUS_BLOCK* iosb)
 {
-    if (FileObject* file = FileFromHandle(fileHandle); file && file->fd >= 0 && !file->readOnly)
-        fsync(file->fd);
-    Complete(iosb, STATUS_SUCCESS, 0);
-    return STATUS_SUCCESS;
+    FileObject* file = FileFromHandle(fileHandle);
+    uint32_t status = STATUS_SUCCESS;
+    if (file == nullptr || file->fd == kInvalidHostFile || file->isDirectory)
+        status = STATUS_INVALID_HANDLE;
+    else if (file->readOnly)
+        status = STATUS_ACCESS_DENIED;
+    else
+    {
+#ifdef _WIN32
+        if (!FlushFileBuffers(file->fd))
+        {
+            DWORD error = GetLastError();
+            status = error == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
+            fprintf(stderr, "[file] flush of \"%s\" failed: Windows error %lu\n", file->guestPath.c_str(),
+                static_cast<unsigned long>(error));
+        }
+#else
+        if (fsync(file->fd) != 0)
+        {
+            status = errno == EACCES ? STATUS_ACCESS_DENIED : STATUS_UNSUCCESSFUL;
+            fprintf(stderr, "[file] flush of \"%s\" failed: %s\n", file->guestPath.c_str(), strerror(errno));
+        }
+#endif
+    }
+    Complete(iosb, status, 0);
+    return status;
 }
 
 // Info classes (X_FILE_INFORMATION_CLASS).
@@ -497,10 +660,15 @@ uint32_t NtSetInformationFile(uint32_t fileHandle, XIO_STATUS_BLOCK* iosb, uint8
         break;
     case XFileEndOfFileInformation:
         if (length < 8) return STATUS_INFO_LENGTH_MISMATCH;
-        if (file->readOnly || file->fd < 0)
+        if (file->readOnly || file->fd == kInvalidHostFile)
             status = STATUS_ACCESS_DENIED;
+#ifdef _WIN32
+        else if (!TruncateFile(file->fd, uint64_t(*reinterpret_cast<be<uint64_t>*>(info))))
+            status = STATUS_UNSUCCESSFUL;
+#else
         else if (ftruncate(file->fd, off_t(uint64_t(*reinterpret_cast<be<uint64_t>*>(info)))) != 0)
             status = STATUS_UNSUCCESSFUL;
+#endif
         written = 8;
         break;
     case XFileAllocationInformation:

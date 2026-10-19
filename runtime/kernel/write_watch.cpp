@@ -4,10 +4,21 @@
 #include "memory.h"
 
 #include <cpu/guest_time.h>
+#include <cerrno>
+#ifdef _WIN32
+#include <windows.h>
+constexpr int kProtNone = 0;
+constexpr int kProtRead = 1;
+constexpr int kProtWrite = 2;
+#else
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
 #include <dlfcn.h>
+constexpr int kProtNone = PROT_NONE;
+constexpr int kProtRead = PROT_READ;
+constexpr int kProtWrite = PROT_WRITE;
+#endif
 
 namespace writewatch
 {
@@ -17,6 +28,29 @@ namespace writewatch
 
     namespace
     {
+        bool SetPageProtection(void* address, size_t size, int protection)
+        {
+#ifdef _WIN32
+            DWORD nativeProtection = protection == kProtNone ? PAGE_NOACCESS
+                : (protection & kProtWrite) ? PAGE_READWRITE : PAGE_READONLY;
+            DWORD previousProtection;
+            return VirtualProtect(address, size, nativeProtection, &previousProtection) != 0;
+#else
+            return mprotect(address, size, protection) == 0;
+#endif
+        }
+
+        size_t HostPageSize()
+        {
+#ifdef _WIN32
+            SYSTEM_INFO info{};
+            GetSystemInfo(&info);
+            return info.dwPageSize;
+#else
+            return size_t(sysconf(_SC_PAGESIZE));
+#endif
+        }
+
         constexpr uint32_t kPhysicalSize = 0x20000000;
         constexpr uint32_t kWindows[3] = { 0xA0000000, 0xC0000000, 0xE0000000 };
         // GPU hazards are tracked per guest page (4 KB): host pages are 16 KB
@@ -205,7 +239,14 @@ namespace writewatch
                     page++;
                 if (page == first + count)
                     continue;
-                mprotect(PageHost(w, page), size_t(first + count - page) << s_pageShift, prot);
+                if (!SetPageProtection(PageHost(w, page), size_t(first + count - page) << s_pageShift, prot))
+                    fprintf(stderr, "[writewatch] page protection failed: %lu\n",
+#ifdef _WIN32
+                        static_cast<unsigned long>(GetLastError())
+#else
+                        static_cast<unsigned long>(errno)
+#endif
+                    );
                 s_protects.fetch_add(1, std::memory_order_relaxed);
             }
             s_protectNs.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
@@ -380,7 +421,7 @@ namespace writewatch
             if (compare && s_prot[page].load(std::memory_order_relaxed) == 0)
             {
                 Put(s_prot[page], uint8_t(1));
-                ProtectPages(page, 1, PROT_READ);
+                ProtectPages(page, 1, kProtRead);
             }
             const uint8_t* copy = s_snapData.get() + (size_t(slot) << s_pageShift);
             const uint8_t* now = GuestPage(page);
@@ -428,7 +469,7 @@ namespace writewatch
             }
             if (!Change(s_prot[page], prot))
                 return;  // (not with `compare`: an open snapshot's page is prot 0)
-            int os = prot == 2 ? PROT_NONE : prot == 1 ? PROT_READ : PROT_READ | PROT_WRITE;
+            int os = prot == 2 ? kProtNone : prot == 1 ? kProtRead : kProtRead | kProtWrite;
             if (run)
             {
                 run->Add(page, os);
@@ -737,8 +778,24 @@ namespace writewatch
                 // A signal handler can't wait on the gate, only read the flag
                 // itself (a lock-free atomic; Suspended()'s seqlock would spin
                 // forever in a fault that interrupted Suspend or Resume).
-                struct timespec ts{ 0, guesttime::g_state.suspended.load(std::memory_order_relaxed) ? 1'000'000 : 20'000 };
-                nanosleep(&ts, nullptr);
+                if (guesttime::g_state.suspended.load(std::memory_order_relaxed))
+                {
+#ifdef _WIN32
+                    Sleep(1);
+#else
+                    struct timespec ts{ 0, 1'000'000 };
+                    nanosleep(&ts, nullptr);
+#endif
+                }
+                else
+                {
+#ifdef _WIN32
+                    SwitchToThread();
+#else
+                    struct timespec ts{ 0, 20'000 };
+                    nanosleep(&ts, nullptr);
+#endif
+                }
             }
             s_stalls++;
             uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
@@ -746,12 +803,24 @@ namespace writewatch
             if (s_logGuard)
             {
                 static std::atomic<uint32_t> logged{ 0 };
+#ifdef _WIN32
+                char modulePath[MAX_PATH] = "";
+                HMODULE module = nullptr;
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        static_cast<LPCSTR>(t_faultPc), &module))
+                    GetModuleFileNameA(module, modulePath, MAX_PATH);
+                const char* symbol = strrchr(modulePath, '\\');
+                symbol = symbol ? symbol + 1 : modulePath;
+#else
                 Dl_info dl{};
                 dladdr(t_faultPc, &dl);
+                const char* symbol = dl.dli_sname ? dl.dli_sname : "?";
+#endif
                 if (logged++ < 400)
                     fprintf(stderr, "[guard] stall %llu us (%s %08X): %s %08X+%X (submission %llu%s) in %s\n", (unsigned long long)us,
                         t_faultWrite ? "write" : "read", t_faultPhysical, s_gpuTag[sub].load(), s_gpuRange[0][sub].load(),
-                        s_gpuRange[1][sub].load(), (unsigned long long)use, done ? "" : ", gave up", dl.dli_sname ? dl.dli_sname : "?");
+                        s_gpuRange[1][sub].load(), (unsigned long long)use, done ? "" : ", gave up", symbol);
             }
             return done;
         }
@@ -797,7 +866,7 @@ namespace writewatch
 
     void Initialize()
     {
-        s_pageSize = size_t(sysconf(_SC_PAGESIZE));
+        s_pageSize = HostPageSize();
         s_pageShift = uint32_t(__builtin_ctzll(s_pageSize));
         s_pageCount = kPhysicalSize >> s_pageShift;
         s_subsPerPage = s_pageShift > kSubShift ? 1u << (s_pageShift - kSubShift) : 1u;
@@ -843,9 +912,17 @@ namespace writewatch
                 s_lastWriter[i].store(0);
                 s_lastWriterPc[i].store(0);
             }
+#ifdef _WIN32
+            HMODULE module = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCSTR>(&Initialize), &module))
+                s_imageBase = reinterpret_cast<const uint8_t*>(module);
+#else
             Dl_info dl{};
             if (dladdr(reinterpret_cast<const void*>(&Initialize), &dl))
                 s_imageBase = static_cast<const uint8_t*>(dl.dli_fbase);
+#endif
         }
         if (s_logGuard)
         {

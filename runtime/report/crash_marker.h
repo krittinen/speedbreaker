@@ -14,7 +14,8 @@
 // the game had gone (a Steam Frame session its player closed from Steam,
 // 2026-10-15) said nothing about how it ended.
 //
-// POSIX file calls only. Header only (tests/clean_exit_test.cpp).
+// Small descriptor helpers for the crash handler. Header only
+// (tests/clean_exit_test.cpp).
 #pragma once
 #include <cstdint>
 #include <filesystem>
@@ -22,8 +23,14 @@
 #include <system_error>
 #include <vector>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 namespace report::marker
 {
@@ -38,15 +45,27 @@ namespace report::marker
     // it couldn't be made).
     inline int Arm(const char* path)
     {
+#ifdef _WIN32
+        return _open(path, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
         return open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+#endif
     }
 
     // The session ended cleanly: the marker closed and removed.
     inline void Clear(int fd, const char* path)
     {
         if (fd >= 0)
+#ifdef _WIN32
+            _close(fd);
+#else
             close(fd);
+#endif
+#ifdef _WIN32
+        _unlink(path);
+#else
         unlink(path);
+#endif
     }
 
     // An earlier session's marker, as a launch finds it.

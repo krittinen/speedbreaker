@@ -8,7 +8,12 @@
 #include <cpu/ppc_context.h>
 #include <report/report.h>
 
+#ifdef USE_PTHREAD
 #include <sys/resource.h>
+#elif defined(_WIN32)
+#include <cerrno>
+#include <process.h>
+#endif
 
 constexpr size_t PCR_SIZE = 0xAB0;
 constexpr size_t TLS_SIZE = 0x100;
@@ -106,6 +111,7 @@ static size_t GetStackSize()
     }
     return stackSize;
 }
+#endif
 
 void SetHostThreadName(const char* name)
 {
@@ -113,15 +119,32 @@ void SetHostThreadName(const char* name)
     pthread_setname_np(name);
 #elif defined(__linux__)
     pthread_setname_np(pthread_self(), name);
+#elif defined(_WIN32)
+    wchar_t wideName[64];
+    int count = MultiByteToWideChar(CP_UTF8, 0, name, -1, wideName, int(std::size(wideName)));
+    if (count > 0)
+    {
+        using SetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+        HMODULE kernel = GetModuleHandleW(L"Kernel32.dll");
+        auto setName = kernel ? reinterpret_cast<SetThreadDescriptionFn>(
+            GetProcAddress(kernel, "SetThreadDescription")) : nullptr;
+        if (setName)
+            setName(GetCurrentThread(), wideName);
+    }
 #else
     (void)name;
 #endif
     report::RegisterThread(name);  // hang reports sample named threads
 }
 
+#ifdef USE_PTHREAD
 static void* GuestThreadFunc(void* arg)
 {
     GuestThreadHandle* hThread = (GuestThreadHandle*)arg;
+#elif defined(_WIN32)
+static unsigned __stdcall GuestThreadFunc(void* arg)
+{
+    GuestThreadHandle* hThread = static_cast<GuestThreadHandle*>(arg);
 #else
 static void GuestThreadFunc(GuestThreadHandle* hThread)
 {
@@ -144,6 +167,8 @@ static void GuestThreadFunc(GuestThreadHandle* hThread)
     ReleaseKernelObject(hThread);
 #ifdef USE_PTHREAD
     return nullptr;
+#elif defined(_WIN32)
+    return 0;
 #endif
 }
 
@@ -156,11 +181,26 @@ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
     pthread_attr_setstacksize(&attr, GetStackSize());
     refs = 2;  // SpeedBreaker: the handle's reference + the thread's own
     const auto ret = pthread_create(&thread, &attr, GuestThreadFunc, this);
+    pthread_attr_destroy(&attr);
     if (ret != 0) {
+        refs = 1;
+        finished = true;
         fprintf(stderr, "pthread_create failed with error code 0x%X.\n", ret);
         return;
     }
     pthread_detach(thread);
+#elif defined(_WIN32)
+{
+    refs = 2;
+    uintptr_t handle = _beginthreadex(nullptr, 8 * 1024 * 1024, GuestThreadFunc, this, 0, &nativeThreadId);
+    if (!handle)
+    {
+        refs = 1;
+        finished = true;
+        fprintf(stderr, "[thread] _beginthreadex failed with error code %d.\n", errno);
+        return;
+    }
+    CloseHandle(reinterpret_cast<HANDLE>(handle));
 }
 #else
       , thread(GuestThreadFunc, this)
@@ -235,30 +275,20 @@ void GuestThread::SetLastError(uint32_t error)
 #ifdef _WIN32
 void GuestThread::SetThreadName(uint32_t threadId, const char* name)
 {
-#pragma pack(push,8)
-    const DWORD MS_VC_EXCEPTION = 0x406D1388;
-
-    typedef struct tagTHREADNAME_INFO
+    HANDLE thread = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, threadId);
+    if (!thread)
+        return;
+    wchar_t wideName[64];
+    int count = MultiByteToWideChar(CP_UTF8, 0, name, -1, wideName, int(std::size(wideName)));
+    if (count > 0)
     {
-        DWORD dwType; // Must be 0x1000.
-        LPCSTR szName; // Pointer to name (in user addr space).
-        DWORD dwThreadID; // Thread ID (-1=caller thread).
-        DWORD dwFlags; // Reserved for future use, must be zero.
-    } THREADNAME_INFO;
-#pragma pack(pop)
-
-    THREADNAME_INFO info;
-    info.dwType = 0x1000;
-    info.szName = name;
-    info.dwThreadID = threadId;
-    info.dwFlags = 0;
-
-    __try
-    {
-        RaiseException(MS_VC_EXCEPTION, 0, sizeof(info) / sizeof(ULONG_PTR), (ULONG_PTR*)&info);
+        using SetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+        HMODULE kernel = GetModuleHandleW(L"Kernel32.dll");
+        auto setName = kernel ? reinterpret_cast<SetThreadDescriptionFn>(
+            GetProcAddress(kernel, "SetThreadDescription")) : nullptr;
+        if (setName)
+            setName(thread, wideName);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
+    CloseHandle(thread);
 }
 #endif

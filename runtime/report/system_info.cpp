@@ -15,13 +15,25 @@
 #include <set>
 #include <sstream>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <sys/utsname.h>
 #include <unistd.h>
+#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
 
+#ifndef _WIN32
 extern char** environ;
+#endif
 
 namespace report
 {
@@ -111,8 +123,55 @@ namespace report
         }
 #endif
 
+#ifdef _WIN32
+        std::string Utf8(const wchar_t* text)
+        {
+            if (!text || !*text)
+                return {};
+            int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+            if (size <= 1)
+                return {};
+            std::string result(size_t(size), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), size, nullptr, nullptr);
+            result.pop_back();
+            return result;
+        }
+
+        std::string RegistryText(HKEY root, const wchar_t* key, const wchar_t* value)
+        {
+            using RegGetValueFn = LSTATUS(WINAPI*)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
+            static RegGetValueFn regGetValue = [] {
+                HMODULE advapi = LoadLibraryW(L"advapi32.dll");
+                return advapi ? reinterpret_cast<RegGetValueFn>(GetProcAddress(advapi, "RegGetValueW")) : nullptr;
+            }();
+            if (!regGetValue)
+                return {};
+            wchar_t text[512]{};
+            DWORD bytes = sizeof(text), type = 0;
+            if (regGetValue(root, key, value, RRF_RT_REG_SZ, &type, text, &bytes) != ERROR_SUCCESS)
+                return {};
+            return Utf8(text);
+        }
+#endif
+
         std::string OsText()
         {
+#ifdef _WIN32
+            using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+            auto rtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+            OSVERSIONINFOW version{};
+            version.dwOSVersionInfoSize = sizeof(version);
+            if (!rtlGetVersion || rtlGetVersion(&version) != 0)
+                return "Windows";
+            std::wstring versionText = L"Windows";
+            std::string product = RegistryText(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"ProductName");
+            if (!product.empty())
+                return std::format("{} (build {})", product, version.dwBuildNumber);
+            return std::format("{} {}.{}.{}",
+                Utf8(versionText.c_str()), version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber);
+#else
             struct utsname u{};
             uname(&u);
             std::string kernel = std::format("{} {} {}", u.sysname, u.release, u.machine);
@@ -131,6 +190,7 @@ namespace report
                 return std::format("{}, {}; in a container: {}", host, kernel, os.empty() ? "Linux" : os);
             return std::format("{}, {}", os.empty() ? "Linux" : os, kernel);
 #endif
+#endif
         }
 
         std::string MachineText()
@@ -139,6 +199,10 @@ namespace report
             return Sysctl("hw.machine");  // e.g. iPad14,6 (hw.model is the board name)
 #elif defined(__APPLE__)
             return Sysctl("hw.model");
+#elif defined(_WIN32)
+            std::string vendor = RegistryText(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemManufacturer");
+            std::string product = RegistryText(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemProductName");
+            return Trim(vendor + " " + product);
 #else
             std::string vendor = Trim(ReadFile("/sys/class/dmi/id/sys_vendor", 256));
             std::string product = Trim(ReadFile("/sys/class/dmi/id/product_name", 256));
@@ -163,6 +227,26 @@ namespace report
             if (perf > 0 && eff > 0)
                 return std::format("{}, {} performance + {} efficiency cores", model, perf, eff);
             return std::format("{}, {} cores / {} threads", model, SysctlInt("hw.physicalcpu"), logical);
+#elif defined(_WIN32)
+            std::string model = RegistryText(HKEY_LOCAL_MACHINE,
+                L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", L"ProcessorNameString");
+            DWORD bytes = 0;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+            std::vector<uint8_t> buffer(bytes);
+            unsigned cores = 0;
+            if (bytes && GetLogicalProcessorInformationEx(RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &bytes))
+            {
+                for (DWORD offset = 0; offset < bytes;)
+                {
+                    auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data() + offset);
+                    if (info->Relationship == RelationProcessorCore)
+                        cores++;
+                    offset += info->Size;
+                }
+            }
+            return cores ? std::format("{}, {} cores / {} threads", model.empty() ? "unknown CPU" : model, cores, logical)
+                         : std::format("{}, {} threads", model.empty() ? "unknown CPU" : model, logical);
 #else
             std::string info = ReadFile("/proc/cpuinfo", 4 << 20);
             std::string model;
@@ -194,6 +278,14 @@ namespace report
             constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 #ifdef __APPLE__
             return std::format("{:.1f} GB", double(SysctlInt("hw.memsize")) / kGiB);
+#elif defined(_WIN32)
+            MEMORYSTATUSEX memory{};
+            memory.dwLength = sizeof(memory);
+            if (!GlobalMemoryStatusEx(&memory))
+                return "unknown";
+            return std::format("{:.1f} GB ({:.1f} GB available at startup), page file {:.1f} GB",
+                double(memory.ullTotalPhys) / kGiB, double(memory.ullAvailPhys) / kGiB,
+                double(memory.ullTotalPageFile) / kGiB);
 #else
             std::string info = ReadFile("/proc/meminfo");
             auto field = [&](const char* key) -> double {
@@ -214,6 +306,12 @@ namespace report
                 const char* v = std::getenv(name);
                 return v ? v : "";
             };
+#ifdef _WIN32
+            if (!env("SteamGameId").empty() || !env("SteamAppId").empty())
+                parts.push_back("launched from Steam");
+            if (!env("NFSMW_LIFELINE_PID").empty())
+                parts.push_back("scripts/steamos/speedbreaker.sh");
+#else
             // What the environment says; whether the game went with Game
             // Mode (NFSMW_GAME_MODE can say otherwise) is on the Display line.
             if (!env("GAMESCOPE_WAYLAND_DISPLAY").empty())
@@ -232,6 +330,7 @@ namespace report
                 parts.push_back("in a container");
             if (!env("NFSMW_LIFELINE_PID").empty())
                 parts.push_back("scripts/steamos/speedbreaker.sh");
+#endif
             std::string text;
             for (const std::string& p : parts)
                 text += (text.empty() ? "" : "; ") + p;
@@ -241,9 +340,21 @@ namespace report
         std::string EnvironmentText()
         {
             std::vector<std::string> vars;
+#ifdef _WIN32
+            wchar_t* environment = GetEnvironmentStringsW();
+            for (const wchar_t* entry = environment; entry && *entry; entry += wcslen(entry) + 1)
+            {
+                std::string utf8 = Utf8(entry);
+                if (utf8.starts_with("NFSMW_"))
+                    vars.push_back(std::move(utf8));
+            }
+            if (environment)
+                FreeEnvironmentStringsW(environment);
+#else
             for (char** e = environ; e && *e; e++)
                 if (strncmp(*e, "NFSMW_", 6) == 0)
                     vars.push_back(*e);
+#endif
             std::sort(vars.begin(), vars.end());
             std::string text;
             for (const std::string& v : vars)
