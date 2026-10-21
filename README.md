@@ -32,6 +32,10 @@
 > **SpeedBreaker is an unofficial fan project by project(u). It is not affiliated with, endorsed
 > by or sponsored by Electronic Arts Inc., the Need for Speed brand or Valve Corporation.**
 >
+> **This repository is a personal-use fork of SpeedBreaker for experimenting with Copilot
+> AI-assisted development and graphical improvements. It is independent of the upstream project;
+> changes here may be experimental and are not official SpeedBreaker releases.**
+>
 > **No game files are included or distributed.** To play, you need your own legally obtained
 > backup (a disc image) of your own Xbox 360 disc of *Need for Speed: Most Wanted* (2005). The
 > in-app installer verifies it and installs it. Please don't ask for, or share, game files or
