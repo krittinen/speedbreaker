@@ -53,6 +53,7 @@ namespace settings
         Anisotropy,
         Mipmaps,
         InternalResolution,
+        ShadowResolution,
         WindowWidth,   // hidden: the window's size, remembered between runs
         WindowHeight,  // hidden
         // Audio
@@ -113,8 +114,8 @@ namespace settings
     // device is hot or can't hold 60).
     constexpr int32_t kFrameRateAuto = 0;
     // Internal resolution: the multiple of 720p it renders at, in half steps
-    // (2: 1x, 3: 1.5x = 1080p, 4: 2x, 6: 3x; only the tokens "1x", "1.5x"...
-    // are saved, so the numbers are free to change); Auto picks it from the
+    // (2: 1x, 3: 1.5x = 1080p, 4: 2x, 6: 3x, 8: 4x; only the tokens "1x",
+    // "1.5x"... are saved, so the numbers are free to change); Auto picks it from the
     // screen area the picture covers (see renderer).
     constexpr int32_t kResolutionAuto = 0;
     // Auto: a screen of another shape is filled (video/picture_fit), the HUD
