@@ -1667,9 +1667,58 @@ namespace gpu::renderer
             return vs.module;
         }
 
-        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
+        // The blocker search runs once per 9-tap group (cached per pixel in
+        // globals); each of the game's taps then reads one jittered depth
+        // inside the penumbra, so the game's own 9-tap average becomes the
+        // filter. PCSS_SCALE: filter radius in texels per unit of normalized
+        // depth difference; PCSS_MAX_RADIUS: widest search / filter radius.
+        constexpr char kShadowPcssGlsl[] = R"(
+vec2 g_pcssUv[64];
+int g_pcssGroup = -1;
+float g_pcssRadius = 0.0;
+float g_pcssAngle = 0.0;
+
+float shadowPcssSample(sampler2D shadowMap, vec2 uv, float receiverDepth, int group, int tap)
+{
+    ivec2 size = textureSize(shadowMap, 0);
+    ivec2 maxPixel = size - ivec2(1);
+    vec2 center = uv * vec2(size);
+    // Radii are in guest (1600-wide) texels: scale them so the penumbra keeps
+    // the same world size at any shadow resolution.
+    float texelScale = float(size.x) / 1600.0;
+    if (g_pcssGroup != group)
+    {
+        g_pcssGroup = group;
+        g_pcssAngle = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.2831853;
+        float blockerDepth = 0.0;
+        int blockerCount = 0;
+        for (int i = 0; i < 8; ++i)
         {
-            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0);
+            float a = g_pcssAngle + float(i) * 2.39996323;
+            vec2 offset = vec2(cos(a), sin(a)) * (sqrt((float(i) + 0.5) / 8.0) * PCSS_MAX_RADIUS * texelScale);
+            float depth = texelFetch(shadowMap, clamp(ivec2(floor(center + offset)), ivec2(0), maxPixel), 0).x;
+            if (depth < receiverDepth)
+            {
+                blockerDepth += depth;
+                ++blockerCount;
+            }
+        }
+        g_pcssRadius = blockerCount == 0 ? 0.0 :
+            clamp((receiverDepth - blockerDepth / float(blockerCount)) * PCSS_SCALE, 1.0, PCSS_MAX_RADIUS);
+    }
+    if (g_pcssRadius <= 0.0)
+        return receiverDepth + 1.0;
+    float a = g_pcssAngle + 1.0 + float(tap) * 2.39996323;
+    vec2 offset = vec2(cos(a), sin(a)) * (sqrt((float(tap) + 0.5) / 9.0) * g_pcssRadius * texelScale);
+    float depth = texelFetch(shadowMap, clamp(ivec2(floor(center + offset)), ivec2(0), maxPixel), 0).x;
+    return depth >= receiverDepth ? receiverDepth + 1.0 : receiverDepth - 1.0;
+}
+)";
+        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, uint32_t pcssSlot = 32)
+        {
+            bool pcss = pcssSlot < 32;
+            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) |
+                (pcss ? (1u << 21) | (pcssSlot << 22) : 0);
             std::lock_guard lock(ps.compileMutex);
             auto it = ps.variants.find(key);
             if (it != ps.variants.end())
@@ -1683,8 +1732,38 @@ namespace gpu::renderer
                     preamble += std::format("#define IN{}\n", i);
             if (alphaTest)
                 preamble += "#define ALPHA_TEST\n";
-            std::string log;
-            auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble);
+            const std::string fallbackPreamble = preamble;
+            std::string source = ps.info.glsl;
+            if (pcss)
+            {
+                size_t main = source.find("void main()");
+                if (!(ps.info.pcssSlotMask & (1u << pcssSlot)) || main == std::string::npos)
+                {
+                    pcss = false;
+                    key &= ~((1u << 21) | (31u << 22));
+                }
+                else
+                {
+                    static const float pcssScale = [] { const char* v = getenv("NFSMW_PCSS_SCALE"); return v ? float(atof(v)) : 400.0f; }();
+                    static const float pcssMaxRadius = [] { const char* v = getenv("NFSMW_PCSS_MAX_RADIUS"); return v ? float(atof(v)) : 8.0f; }();
+                    preamble += std::format("#define SHADOW_PCSS\n#define SHADOW_PCSS_SLOT {}\n#define PCSS_SCALE {:.4f}\n#define PCSS_MAX_RADIUS {:.4f}\n",
+                        pcssSlot, pcssScale, pcssMaxRadius);
+                    source.insert(main, kShadowPcssGlsl);
+                    static std::unordered_set<uint64_t> loggedProfiles;
+                    uint64_t profileKey = ps.hash ^ (uint64_t(pcssSlot) << 56);
+                    if (loggedProfiles.insert(profileKey).second)
+                        fprintf(stderr, "[shadow-filter] PCSS enabled for ps_%016llx slot %u\n",
+                            (unsigned long long)ps.hash, pcssSlot);
+                }
+            }            std::string log;
+            auto spirv = CompileGlsl(source, GLSLANG_STAGE_FRAGMENT, log, preamble);
+            if (spirv.empty() && pcss)
+            {
+                fprintf(stderr, "[shadow-filter] PCSS compile failed for ps_%016llx slot %u; falling back to Original:\n%s\n",
+                    (unsigned long long)ps.hash, pcssSlot, log.c_str());
+                log.clear();
+                spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, fallbackPreamble);
+            }
             VkShaderModule module = VK_NULL_HANDLE;
             if (spirv.empty())
                 fprintf(stderr, "[renderer] ps_%016llx (variant %x): GLSL compile failed:\n%s\n",
@@ -1901,6 +1980,7 @@ namespace gpu::renderer
         bool s_scaleFixed = false;   // NFSMW_RENDER_SCALE: no live changes
         int32_t s_shadowResolutionSetting = 0;
         gpu::RenderScale s_shadowScale;
+        int32_t s_shadowFilteringSetting = int32_t(settings::ShadowFilteringMode::Original);
 
         // What the Internal Resolution setting asks for with the picture
         // covering `regionW` x `regionH` of the swapchain.
@@ -2528,6 +2608,23 @@ namespace gpu::renderer
         };
         std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> s_pipelines;
 
+        uint32_t ShadowTextureSlot(const Shader& shader)
+        {
+            uint32_t slots = shader.info.texture2DMask;
+            for (; slots; slots &= slots - 1)
+            {
+                uint32_t slot = uint32_t(__builtin_ctz(slots));
+                xenos::xe_gpu_texture_fetch_t fetch;
+                memcpy(&fetch, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6], sizeof(fetch));
+                uint32_t width = fetch.size_2d.width + 1;
+                uint32_t height = fetch.size_2d.height + 1;
+                if (fetch.type == xenos::FetchConstantType::kTexture && uint32_t(fetch.format) == 22 &&
+                    width == 1600 && height == 1600)
+                    return slot;
+            }
+            return 32;
+        }
+
         VkBlendFactor BlendFactor(uint32_t f)
         {
             switch (f)
@@ -2580,7 +2677,9 @@ namespace gpu::renderer
                     outputs |= 1u << i;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
             uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
+            uint32_t pcssSlot = ((key.pad >> 5) & 3) == uint32_t(settings::ShadowFilteringMode::PcssPrototype)
+                ? key.pad & 31 : 32;
+            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, pcssSlot);
             if (!psModule)
                 return VK_NULL_HANDLE;
             stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -3724,10 +3823,11 @@ void main()
         int s_autoAnisotropy = 16;      // "Auto": set in CreateSharedMemory
 
         // `maxLevel`: the texture's last mip level (0: base only).
-        VkSampler GetSampler(const xenos::xe_gpu_texture_fetch_t& f, uint32_t maxLevel)
+        VkSampler GetSampler(const xenos::xe_gpu_texture_fetch_t& f, uint32_t maxLevel, bool shadowMap)
         {
             // The setting is part of the key: a change makes new samplers,
             // while command buffers in flight keep theirs (never destroyed).
+            (void)shadowMap;
             int anisotropy = settings::GetInt(settings::Id::Anisotropy);
             if (anisotropy == settings::kAnisotropyAuto)
                 anisotropy = s_autoAnisotropy;
@@ -3749,8 +3849,8 @@ void main()
                 }
             };
             VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-            sci.magFilter = f.mag_filter == xenos::TextureFilter::kPoint ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-            sci.minFilter = f.min_filter == xenos::TextureFilter::kPoint ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+            sci.magFilter =             f.mag_filter == xenos::TextureFilter::kPoint ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+                        sci.minFilter = f.min_filter == xenos::TextureFilter::kPoint ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
             sci.addressModeU = address(f.clamp_x);
             sci.addressModeV = address(f.clamp_y);
             sci.addressModeW = address(f.clamp_z);
@@ -3971,7 +4071,7 @@ void main()
                     uint32_t(textureScale.HostPixels(width, height) * 4 <= scaledMemory.scratchSize),
                     uint32_t(scaledCandidate), uint32_t(scaledRangeValid), uint32_t(scaled));
             }
-            sampler = GetSampler(f, maxLevel);
+            sampler = GetSampler(f, maxLevel, shadowMap);
             if (out)
                 *out = { nullptr, base, size, mipBase, mipSize, scaledCandidate, shadowPool };
 
@@ -6869,6 +6969,13 @@ void main()
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         }
 
+        void ApplyShadowFiltering(int32_t setting)
+        {
+            s_shadowFilteringSetting = setting;
+            const char* mode = setting == int32_t(settings::ShadowFilteringMode::PcssPrototype) ? "PCSS (prototype)" : "Original";
+            fprintf(stderr, "[renderer] shadow filtering %s: shader pipelines selected per draw\n", mode);
+        }
+
         void ApplyLiveSettings()
         {
             uint64_t generation = settings::Generation();
@@ -6881,6 +6988,9 @@ void main()
                 int32_t shadowResolution = settings::GetInt(settings::Id::ShadowResolution);
                 if (shadowResolution != s_shadowResolutionSetting)
                     ApplyShadowResolution(shadowResolution);
+                int32_t shadowFiltering = settings::GetInt(settings::Id::ShadowFiltering);
+                if (shadowFiltering != s_shadowFilteringSetting)
+                    ApplyShadowFiltering(shadowFiltering);
             }
             if (s_scaleFixed)
                 return;
@@ -7002,6 +7112,7 @@ void main()
                     (unsigned long long)(kSharedPart >> 20), props.limits.maxStorageBufferRange >> 20);
             s_resolutionSetting = settings::GetInt(settings::Id::InternalResolution);
             s_loadMips = settings::GetBool(settings::Id::Mipmaps);
+            s_shadowFilteringSetting = settings::GetInt(settings::Id::ShadowFiltering);
             s_liveGeneration = settings::Generation();
             uint32_t count = 0;
             vkEnumerateDeviceExtensionProperties(s_vk->physical, nullptr, &count, nullptr);
@@ -7548,6 +7659,13 @@ void main()
         PipelineKey key{};
         key.vs = s_vs->hash;
         key.ps = s_ps->hash;
+        const int shadowFiltering = settings::GetInt(settings::Id::ShadowFiltering);
+        if (shadowFiltering == int(settings::ShadowFilteringMode::PcssPrototype))
+        {
+            uint32_t shadowSlot = ShadowTextureSlot(*s_ps);
+            if (shadowSlot < 32 && (s_ps->info.pcssSlotMask & (1u << shadowSlot)))
+                key.pad = (uint32_t(shadowFiltering) << 5) | shadowSlot;
+        }
         key.topology = topology;
         key.restart = restart;
         static const uint32_t blendRegs[4] = { XE_GPU_REG_RB_BLENDCONTROL0, XE_GPU_REG_RB_BLENDCONTROL1,

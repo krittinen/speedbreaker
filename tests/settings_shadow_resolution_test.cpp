@@ -51,6 +51,7 @@ int main(int argc, char** argv)
     using namespace settings;
     constexpr Id id = Id::ShadowResolution;
     SetEnv("NFSMW_SHADOW_RESOLUTION", nullptr);
+    SetEnv("NFSMW_SHADOW_FILTERING", nullptr);
     const std::filesystem::path dir = argc > 1 ? argv[1] : "settings_shadow_resolution_scratch";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
@@ -99,6 +100,32 @@ int main(int argc, char** argv)
     CHECK(Save(file) && Read(file).find("shadow_resolution = \"4x\"") != std::string::npos,
         "saving preserves the configured value, not the override");
     SetEnv("NFSMW_SHADOW_RESOLUTION", nullptr);
+
+    constexpr Id filteringId = Id::ShadowFiltering;
+    const Option& filtering = Info(filteringId);
+    CHECK(filtering.category == Category::Graphics && filtering.type == Type::Enum &&
+        filtering.apply == Apply::Live && !filtering.hidden, "available as a live Graphics menu option");
+    CHECK(std::string(filtering.table) == "video" && std::string(filtering.key) == "shadow_filtering",
+        "stored in [video].shadow_filtering");
+    CHECK(std::string(filtering.env) == "NFSMW_SHADOW_FILTERING", "environment override name");
+    CHECK(DefaultValue(filteringId) == int32_t(ShadowFilteringMode::Original), "Original is the default");
+    CHECK(filtering.entries.size() == 2, "Original and PCSS prototype choices");
+    if (filtering.entries.size() == 2)
+    {
+        CHECK(filtering.entries[0].value == int32_t(ShadowFilteringMode::Original) &&
+            std::string(filtering.entries[0].token) == "original", "first: Original filtering");
+        CHECK(filtering.entries[1].value == int32_t(ShadowFilteringMode::PcssPrototype) &&
+            std::string(filtering.entries[1].token) == "pcss", "second: PCSS prototype");
+    }
+    CHECK(Set(filteringId, int32_t(ShadowFilteringMode::PcssPrototype)) == SetResult::Applied, "PCSS applies live");
+    CHECK(Save(file) && Read(file).find("shadow_filtering = \"pcss\"") != std::string::npos,
+        "PCSS is saved as a TOML token");
+    SetEnv("NFSMW_SHADOW_FILTERING", "original");
+    CHECK(Load(file) && GetInt(filteringId) == int32_t(ShadowFilteringMode::Original),
+        "Original environment override is loaded");
+    CHECK(Save(file) && Read(file).find("shadow_filtering = \"pcss\"") != std::string::npos,
+        "saving preserves the configured value, not the override");
+    SetEnv("NFSMW_SHADOW_FILTERING", nullptr);
 
     std::filesystem::remove_all(dir);
     if (s_failures)

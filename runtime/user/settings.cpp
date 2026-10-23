@@ -125,6 +125,11 @@ namespace settings
             { 8, "4x", "4x (6400x6400)" },
         };
 
+        constexpr EnumEntry kShadowFilteringEntries[] = {
+            { int32_t(ShadowFilteringMode::Original), "original", "Original" },
+            { int32_t(ShadowFilteringMode::PcssPrototype), "pcss", "PCSS (prototype)" },
+        };
+
         constexpr EnumEntry kAnisotropyEntries[] = {
             { kAnisotropyAuto, "auto", "Auto" },
             { 1, "off", "Off" },
@@ -225,6 +230,10 @@ namespace settings
               .table = "video", .key = "shadow_resolution", .label = "Shadow Resolution",
               .description = "Resolution of the 1600x1600 sun shadow map, independent of Internal Resolution. Higher settings use more GPU time and memory; a separate 256 MB pool is allocated above 1x.",
               .env = "NFSMW_SHADOW_RESOLUTION", .defaultValue = 2, .entries = kShadowResolutionEntries },
+            { .id = Id::ShadowFiltering, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Live,
+              .table = "video", .key = "shadow_filtering", .label = "Shadow Filtering",
+              .description = "Original: the game's linear filtering. PCSS is an experimental soft-shadow prototype.",
+              .env = "NFSMW_SHADOW_FILTERING", .defaultValue = double(ShadowFilteringMode::Original), .entries = kShadowFilteringEntries },
             { .id = Id::WindowWidth, .category = Category::Display, .type = Type::Int, .apply = Apply::Restart, .hidden = true,
               .table = "video", .key = "window_width", .label = "Window Width",
               .description = "The window's width when the game starts.",

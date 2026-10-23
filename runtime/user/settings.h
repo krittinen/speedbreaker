@@ -54,6 +54,7 @@ namespace settings
         Mipmaps,
         InternalResolution,
         ShadowResolution,
+        ShadowFiltering,
         WindowWidth,   // hidden: the window's size, remembered between runs
         WindowHeight,  // hidden
         // Audio
@@ -124,6 +125,7 @@ namespace settings
     // taller view (Vert+, down to 4:3). Only a screen within 1% of 16:9 keeps
     // the 16:9 frame (video::kTallMinStretch). Widescreen: 16:9 with bars.
     enum class AspectMode : int32_t { Auto = 0, Widescreen = 1 };
+    enum class ShadowFilteringMode : int32_t { Original = 0, PcssPrototype = 1 };
     // Anisotropy: 1 (off), 2, 4, 8, 16, or one of these.
     constexpr int32_t kAnisotropyAuto = 0;   // 16x on a discrete GPU or an M-series iPad, 4x on other integrated ones
     constexpr int32_t kAnisotropyGame = -1;  // each texture's own setting, as on the 360
