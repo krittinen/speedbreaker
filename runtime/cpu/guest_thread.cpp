@@ -189,6 +189,7 @@ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
         return;
     }
     pthread_detach(thread);
+}
 #elif defined(_WIN32)
 {
     refs = 2;
