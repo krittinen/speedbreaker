@@ -66,7 +66,6 @@ namespace
     {
         const char* name;
         uint32_t calls = 0;
-        uint32_t logged = 0;
         float last = 1e30f;
     };
 
@@ -77,10 +76,9 @@ namespace
         static std::mutex mutex;
         std::lock_guard lock(mutex);
         site.calls++;
-        if (site.logged >= 400 || (site.calls > 24 && std::fabs(value - site.last) < 1e-4f))
+        if (site.calls > 24 && std::fabs(value - site.last) < 1e-4f)
             return;
         site.last = value;
-        site.logged++;
         const uint32_t tod = PPC_LOAD_U32(kTodPointer);
         if (tod)
             fprintf(stderr, "[tod] %s #%u lr=%08X r3=%08X value=%.5f | obj %08X rate=%.5f phase=%.5f azimuth=%.5f blend=%.5f/%.5f overcast=%.5f\n",
