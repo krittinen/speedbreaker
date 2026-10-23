@@ -1981,6 +1981,13 @@ float shadowPcssSample(sampler2D shadowMap, vec2 uv, float receiverDepth, int gr
         int32_t s_shadowResolutionSetting = 0;
         gpu::RenderScale s_shadowScale;
         int32_t s_shadowFilteringSetting = int32_t(settings::ShadowFilteringMode::Original);
+        // NFSMW_PCSS_AB=1 (measurement): the Shadow Filtering setting is
+        // ignored; every other 120-frame window runs PCSS, the rest Original,
+        // and a [pcss-cost] line per window gives the GPU executing time per
+        // frame of each arm and what PCSS adds. Turns the GPU timestamps on.
+        const bool s_pcssAb = [] { const char* v = std::getenv("NFSMW_PCSS_AB"); return v && v[0] == '1'; }();
+        int32_t s_pcssAbMode = int32_t(settings::ShadowFilteringMode::Original);
+        uint64_t s_pcssAbDraws = 0;  // draws that ran the PCSS variant, this window
 
         // What the Internal Resolution setting asks for with the picture
         // covering `regionW` x `regionH` of the swapchain.
@@ -7154,7 +7161,7 @@ void main()
             VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
             qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
             qpci.queryCount = kSlots * 2;
-            if (const char* v = std::getenv("NFSMW_GPU_TIMING"); v && v[0] == '1')
+            if (const char* v = std::getenv("NFSMW_GPU_TIMING"); s_pcssAb || (v && v[0] == '1'))
                 if (vkCreateQueryPool(s_dev, &qpci, nullptr, &s_timestamps) != VK_SUCCESS)
                     s_timestamps = VK_NULL_HANDLE;
             if (s_profileFrame >= 0)
@@ -7659,12 +7666,15 @@ void main()
         PipelineKey key{};
         key.vs = s_vs->hash;
         key.ps = s_ps->hash;
-        const int shadowFiltering = settings::GetInt(settings::Id::ShadowFiltering);
+        const int shadowFiltering = s_pcssAb ? s_pcssAbMode : settings::GetInt(settings::Id::ShadowFiltering);
         if (shadowFiltering == int(settings::ShadowFilteringMode::PcssPrototype))
         {
             uint32_t shadowSlot = ShadowTextureSlot(*s_ps);
             if (shadowSlot < 32 && (s_ps->info.pcssSlotMask & (1u << shadowSlot)))
+            {
                 key.pad = (uint32_t(shadowFiltering) << 5) | shadowSlot;
+                s_pcssAbDraws++;
+            }
         }
         key.topology = topology;
         key.restart = restart;
@@ -9455,6 +9465,34 @@ void main()
             }
             fprintf(stderr, "[barrier] alt: frames %llu-%llu run with level %u\n", (unsigned long long)(frame + 1),
                 (unsigned long long)(frame + 120), s_passBarrier);
+        }
+        // NFSMW_PCSS_AB: the window ending here, then the next one's mode.
+        // The GPU time comes from the completion thread, a little behind the
+        // swap: the same lag in every window, so it cancels in the means.
+        if (s_pcssAb && frame % 120 == 0)
+        {
+            static uint64_t lastExecNs = 0;
+            static double sumMs[2] = {};
+            static int windows[2] = {};
+            const uint64_t execNs = s_gpuExecNs.load();
+            const int arm = s_pcssAbMode == int32_t(settings::ShadowFilteringMode::PcssPrototype) ? 1 : 0;
+            const double ms = double(execNs - lastExecNs) / 1e6 / 120;
+            lastExecNs = execNs;
+            if (frame > 120)  // the first window is startup
+            {
+                sumMs[arm] += ms;
+                windows[arm]++;
+            }
+            char mean[96] = "";
+            if (windows[0] && windows[1])
+                snprintf(mean, sizeof(mean), " | mean over %d+%d windows: PCSS adds %.2f ms/frame", windows[0], windows[1],
+                    sumMs[1] / windows[1] - sumMs[0] / windows[0]);
+            fprintf(stderr, "[pcss-cost] frames %llu-%llu %s: GPU executing %.2f ms/frame, %.1f PCSS draws/frame%s\n",
+                (unsigned long long)(frame - 119), (unsigned long long)frame, arm ? "PCSS" : "Original", ms,
+                double(s_pcssAbDraws) / 120, mean);
+            s_pcssAbDraws = 0;
+            s_pcssAbMode = (frame / 120) % 2 ? int32_t(settings::ShadowFilteringMode::PcssPrototype)
+                                              : int32_t(settings::ShadowFilteringMode::Original);
         }
         // NFSMW_LOG_UNTILED_AREA=1: with each [perf] line, whether the toggle
         // was on in its window (=alt: every other one) and what it did.
