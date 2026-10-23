@@ -1,0 +1,7 @@
+# LF in the repository and in every checkout, so shell scripts, patches and
+# sources build the same on Windows and Linux.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.ttf binary
