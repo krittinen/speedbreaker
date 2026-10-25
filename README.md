@@ -440,6 +440,7 @@ then Yes, puts it back.
 | Anisotropic Filtering | Auto / Off / 2x / 4x / 8x / 16x / Original | Auto: 16x on dedicated graphics cards and M-series iPads, 4x elsewhere. Original uses each texture's own setting, as on the 360. |
 | Mipmaps | On / Off | On, so distant textures don't shimmer |
 | Internal Resolution | Auto / 1x (720p) / 1.5x (1080p) / 2x (1440p) / 3x (2160p) | Auto: enough to cover your screen, within what the device can afford (whole scales only: 1x, 2x, 3x, or 3x2 on an ultrawide). On iPhone and iPad, Auto always picks 1x. |
+| Shadow Filtering | Original / PCSS (experimental) | Original keeps the game's linear sampling. PCSS finds the game's shadow-map compares in any pixel shader and replaces its 3x3 PCF taps with an 8-sample blocker search plus one rotated Poisson-disk sample per tap, so it also covers shaders added later in the game. It costs a few percent more GPU time; `NFSMW_PCSS_SCALE` (default 400) and `NFSMW_PCSS_MAX_RADIUS` (default 8 shadow-map texels) tune the penumbra. Saved as `[video].shadow_filtering`; `NFSMW_SHADOW_FILTERING` overrides it for a run. |
 
 **Audio:** Master Volume (100%), Mute (Off), and Mute in Background (Off), which silences the
 game while its window isn't in front.

@@ -110,6 +110,11 @@ namespace settings
             { 6, "3x", "3x (2160p)" },
         };
 
+        constexpr EnumEntry kShadowFilteringEntries[] = {
+            { int32_t(ShadowFilteringMode::Original), "original", "Original" },
+            { int32_t(ShadowFilteringMode::PcssExperimental), "pcss", "PCSS (experimental)" },
+        };
+
         constexpr EnumEntry kAnisotropyEntries[] = {
             { kAnisotropyAuto, "auto", "Auto" },
             { 1, "off", "Off" },
@@ -258,6 +263,10 @@ namespace settings
               .table = "video", .key = "internal_resolution", .label = "Internal Resolution",
               .description = "Render the 3D scene above the 360's 720p. 1.5x is 1080p, a little over half the pixels of 2x. Auto: from the screen (1440p: 2x, or 3x2 filling an ultrawide).",
               .env = "NFSMW_RESOLUTION", .defaultValue = kResolutionAuto, .entries = kResolutionEntries },
+            { .id = Id::ShadowFiltering, .category = Category::Experimental, .type = Type::Enum, .apply = Apply::Live,
+              .table = "video", .key = "shadow_filtering", .label = "Shadow Filtering",
+              .description = "Original: the game's linear filtering. PCSS is an experimental soft-shadow prototype.",
+              .env = "NFSMW_SHADOW_FILTERING", .defaultValue = double(ShadowFilteringMode::Original), .entries = kShadowFilteringEntries },
             { .id = Id::WindowWidth, .category = Category::Display, .type = Type::Int, .apply = Apply::Restart, .hidden = true,
               .table = "video", .key = "window_width", .label = "Window Width",
               .description = "The window's width when the game starts.",
@@ -1205,6 +1214,7 @@ namespace settings
         case Category::Controls: return "Controls";
         case Category::Wheel: return "Wheel";
         case Category::Advanced: return "Advanced";
+        case Category::Experimental: return "Experimental";
         default: return "";
         }
     }

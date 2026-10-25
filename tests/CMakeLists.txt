@@ -94,6 +94,9 @@ endif()
 # it): "fsr1" read, saved and read back, the environment's override, an
 # unknown value; in a scratch folder.
 sb_test(settings_scaling_test SOURCES ${RT}/user/settings.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/settings_scaling_scratch)
+# Shadow Filtering's saved value and per-run override (user/settings.cpp).
+sb_test(settings_shadow_filtering_test SOURCES ${RT}/user/settings.cpp
+    ARGS ${CMAKE_CURRENT_BINARY_DIR}/settings_shadow_filtering_scratch)
 # Internal Resolution Auto's budget on iPhones and iPads, chip by chip
 # (video/scale_budget.cpp), and the scale it makes on the phones' screens.
 sb_test(scale_budget_test SOURCES ${RT}/video/scale_budget.cpp ${RT}/video/picture_fit.cpp)
