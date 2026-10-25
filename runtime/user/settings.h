@@ -134,6 +134,8 @@ namespace settings
         // Advanced
         AsyncShaders,
         PerformanceOverlay,
+        // Game (the [game] table)
+        GameLanguage,  // game/language.cpp: the game's language, game::language's ids (English = 0)
         Count
     };
     constexpr size_t kCount = size_t(Id::Count);
@@ -141,7 +143,7 @@ namespace settings
     // Key: a key code of user/key_names.h (0: no key), saved by its name
     // there ("w", "left_shift", "none"); the menu takes it from a key press.
     enum class Type : uint8_t { Bool, Int, Float, Enum, Key };
-    enum class Category : uint8_t { Display, Graphics, Audio, Input, Wheel, Controls, Advanced, Experimental, Count };
+    enum class Category : uint8_t { Display, Graphics, Audio, Input, Wheel, Controls, Game, Advanced, Experimental, Count };
     enum class Apply : uint8_t { Live, Restart };
 
     // Values of the enum options (GetInt returns them).
@@ -247,11 +249,14 @@ namespace settings
     double GetStoredValue(Id id);
     bool IsDefault(Id id);  // stored value == default
 
-    // Main thread, before Load(): `value` is the option's default on this
-    // device instead of the table's (Frame Rate's Auto on an iPhone): what a
-    // settings.toml without the option gives, and what Reset and IsDefault
-    // use. Logged, with `why`. A settings.toml that a save wrote holds every
-    // option, so it keeps the value it has.
+    // Main thread: `value` is the option's default on this device instead of
+    // the table's (Frame Rate's Auto on an iPhone): what a settings.toml
+    // without the option gives, and what Reset and IsDefault use. Logged,
+    // with `why`. A settings.toml that a save wrote holds every option, so
+    // it keeps the value it has. Before Load(), or after it for a GPU's
+    // defaults (its device exists only once the window does): then an
+    // option the file didn't hold, unchanged since and applied live, takes
+    // the new default at once (listeners are told; not a change to save).
     void SetDeviceDefault(Id id, double value, std::string_view why);
     // The option's default on this device: the table's, or SetDeviceDefault's.
     double DefaultValue(Id id);
@@ -345,4 +350,11 @@ namespace settings
     // the [app] table is rewritten); any thread.
     bool RefreshNoticeShown(int hz);
     bool RecordRefreshNotice(int hz);
+
+    // The "no rumble over USB" note for an Xbox controller on a Mac
+    // (hid/rumble_note.h) was closed: [app] xbox_usb_rumble_note in
+    // settings.toml. Record sets it, in memory and in the file, as
+    // RecordRefreshNotice does; any thread.
+    bool RumbleNoteShown();
+    bool RecordRumbleNote();
 }
