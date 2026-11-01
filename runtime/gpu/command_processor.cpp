@@ -232,10 +232,48 @@ namespace gpu
             return it->second.value;
         }
 
+        thread_local uint32_t t_dbgOpcode = 0xFF;
+        void DbgLogC5(uint32_t base, uint32_t count, const uint32_t* host, const uint8_t* be)
+        {
+            static const bool logC5 = std::getenv("NFSMW_LOG_C5") != nullptr;
+            static std::atomic<int> logged{ 0 };
+            if (!logC5 || base > 0x4415 || base + count <= 0x4415 || logged.load() >= 80)
+                return;
+            uint32_t bits = 0;
+            if (host)
+                bits = host[0x4415 - base];
+            else
+            {
+                memcpy(&bits, be + size_t(0x4415 - base) * 4, 4);
+                bits = ByteSwap(bits);
+            }
+            float y;
+            memcpy(&y, &bits, 4);
+            uint32_t c0x = 0;
+            if (host)
+                c0x = host[0x4400 - base < count ? 0x4400 - base : 0];
+            else if (base <= 0x4400)
+            {
+                memcpy(&c0x, be + size_t(0x4400 - base) * 4, 4);
+                c0x = ByteSwap(c0x);
+            }
+            float c0f;
+            memcpy(&c0f, &c0x, 4);
+            if (base == 0x4400 && std::fabs(c0f - 0.2125f) < 0.0001f && y > 0.1f)
+            {
+                logged++;
+                const int64_t guest = be ? int64_t(be - g_memory.base) : -1;
+                fprintf(stderr, "[c5] opcode %02X base %04X count %u c5.y=%g source %s%08llX\n", t_dbgOpcode, base, count, y,
+                    guest >= 0 && guest < 0x100000000ll ? "guest " : "register write ", (unsigned long long)(guest >= 0 ? guest : 0));
+            }
+        }
+
         void WriteRegister(uint32_t index, uint32_t value)
         {
             if (index >= REGISTER_COUNT)
                 return;
+            if (index == 0x4415)
+                DbgLogC5(index, 1, &value, nullptr);
             s_regs[index] = value;
             if (index >= 0x4000 && index < 0x4928)  // float/fetch/bool/loop constants
                 renderer::g_constantsDirty.store(true, std::memory_order_relaxed);
@@ -292,6 +330,7 @@ namespace gpu
         // shader constants in runs.
         void WriteRegistersBulk(uint32_t base, const uint8_t* src, uint32_t count)
         {
+            DbgLogC5(base, count, nullptr, src);
             memcpy(MmioRegister(base), src, size_t(count) * 4);
             for (uint32_t m = 0; m < count; m++)
             {
@@ -437,6 +476,7 @@ namespace gpu
         {
             uint32_t opcode = (packet >> 8) & 0x7F;
             uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+            t_dbgOpcode = opcode;
 
             if ((packet & 1) && ((s_binSelect & s_binMask) == 0 || opcode == PM4_XE_SWAP))
             {
@@ -994,6 +1034,27 @@ namespace gpu
                     return true;
                 }
                 index += bases[type];
+                {
+                    // NFSMW_LOG_C5=1: the packets that set pixel c5 (registers
+                    // 0x4414..0x4417) with a nonzero y, and where they read from.
+                    static const bool logC5 = std::getenv("NFSMW_LOG_C5") != nullptr;
+                    static int logged = 0;
+                    if (logC5 && logged < 60 && index <= 0x4415 && index + size > 0x4415)
+                    {
+                        float y = 0;
+                        if (opcode == PM4_LOAD_ALU_CONSTANT)
+                        {
+                            const uint32_t bits = uint32_t(*reinterpret_cast<be<uint32_t>*>(Physical(address + (0x4415 - index) * 4)));
+                            memcpy(&y, &bits, 4);
+                        }
+                        if (opcode == PM4_LOAD_ALU_CONSTANT ? (y != 0.0f || logged < 5) : logged < 5)
+                        {
+                            logged++;
+                            fprintf(stderr, "[c5] %s index %04X size %u address %08X c5.y=%g\n", opcode == PM4_LOAD_ALU_CONSTANT ? "LOAD_ALU" : "SET_CONSTANT",
+                                index, size, address, y);
+                        }
+                    }
+                }
                 if (BulkSafe(index, size))
                 {
                     if (opcode == PM4_LOAD_ALU_CONSTANT)

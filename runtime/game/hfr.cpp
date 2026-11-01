@@ -1426,15 +1426,51 @@ SB_HOOK(sub_823AFC68)
 // A car's render update: copies the body's matrix (its pointer at +52) to
 // +816, deriving the render's velocities from the change (dt in f1).
 extern "C" PPC_FUNC(__imp__sub_824E9C38);
+// Diagnostic (NFSMW_LOG_PS_CONSTS): the fastest car's speed this frame, as
+// the matrix's translation change over dt, for both row/column layouts.
+std::atomic<float> g_diagCarSpeedRow{ 0.0f }, g_diagCarSpeedCol{ 0.0f };
 SB_HOOK(sub_824E9C38)
 {
+    static const bool diag = std::getenv("NFSMW_LOG_PS_CONSTS") != nullptr;
+    float diagBefore[16];
+    const uint32_t diagObject = ctx.r3.u32;
+    if (diag)
+        Load(base, diagObject + kCarMatrix, diagBefore);
+    const double diagDt = ctx.f1.f64;
     if (!s_enabled)
-        return SB_ORIGINAL(sub_824E9C38)(ctx, base);
+    {
+        SB_ORIGINAL(sub_824E9C38)(ctx, base);
+        if (diag && diagDt > 0.0)
+        {
+            float after[16];
+            Load(base, diagObject + kCarMatrix, after);
+            auto dist = [&](int a, int b, int c) {
+                return std::sqrt(std::pow(after[a] - diagBefore[a], 2.0f) + std::pow(after[b] - diagBefore[b], 2.0f) + std::pow(after[c] - diagBefore[c], 2.0f));
+            };
+            const float row = float(dist(12, 13, 14) / diagDt), col = float(dist(3, 7, 11) / diagDt);
+            if (row < 1000.0f && row > g_diagCarSpeedRow.load())
+                g_diagCarSpeedRow.store(row);
+            if (col < 1000.0f && col > g_diagCarSpeedCol.load())
+                g_diagCarSpeedCol.store(col);
+        }
+        return;
+    }
     const uint32_t object = ctx.r3.u32;
     Car& car = s_cars[object];
     Load(base, object + kCarMatrix, car.before);
     SB_ORIGINAL(sub_824E9C38)(ctx, base);
     Load(base, object + kCarMatrix, car.after);
+    if (diag && diagDt > 0.0)
+    {
+        auto dist = [&](int a, int b, int c) {
+            return std::sqrt(std::pow(car.after[a] - car.before[a], 2.0f) + std::pow(car.after[b] - car.before[b], 2.0f) + std::pow(car.after[c] - car.before[c], 2.0f));
+        };
+        const float row = float(dist(12, 13, 14) / diagDt), col = float(dist(3, 7, 11) / diagDt);
+        if (row < 1000.0f && row > g_diagCarSpeedRow.load())
+            g_diagCarSpeedRow.store(row);
+        if (col < 1000.0f && col > g_diagCarSpeedCol.load())
+            g_diagCarSpeedCol.store(col);
+    }
     car.step = Step(base);
 }
 

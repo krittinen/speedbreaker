@@ -32,6 +32,9 @@
 #include <game/hfr.h>
 #include <user/paths.h>
 #include <user/settings.h>
+#include <atomic>
+#include <chrono>
+extern std::atomic<float> g_diagCarSpeedRow, g_diagCarSpeedCol;
 #include <game/cover_callers.h>
 #include <game/split_screen.h>
 #include <game/ultrawide.h>
@@ -128,6 +131,72 @@ namespace gpu::renderer
     namespace
     {
         using namespace xe::gpu;
+
+#ifdef _WIN32
+        uintptr_t s_traceLo = 0, s_traceHi = 0, s_tracePage = 0;
+        DWORD s_traceOldProtect = 0;
+        std::atomic<int> s_traceLogged{ 0 }, s_traceOther{ 0 };
+
+        LONG CALLBACK TraceVeh(EXCEPTION_POINTERS* ep)
+        {
+            const DWORD code = ep->ExceptionRecord->ExceptionCode;
+            if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->ExceptionInformation[0] == 1)
+            {
+                const uintptr_t a = ep->ExceptionRecord->ExceptionInformation[1];
+                if (a < s_tracePage || a >= s_tracePage + 0x1000)
+                    return EXCEPTION_CONTINUE_SEARCH;
+                if (s_traceLogged.load() < 400 && (a >= s_traceLo && a < s_traceHi || s_traceOther.fetch_add(1) < 5))
+                {
+                    const bool inRange = a >= s_traceLo && a < s_traceHi;
+                    const uintptr_t imageBase = uintptr_t(GetModuleHandleW(nullptr));
+                    char line[512];
+                    int n = snprintf(line, sizeof(line), "[trace] write guest %08X%s thread %lu rva:", uint32_t(a - uintptr_t(g_memory.base)), inRange ? "" : " (same page)", GetCurrentThreadId());
+                    CONTEXT c = *ep->ContextRecord;
+                    for (int i = 0; i < 10 && c.Rip; i++)
+                    {
+                        n += snprintf(line + n, sizeof(line) - n, " %llX", (unsigned long long)(c.Rip - imageBase));
+                        DWORD64 base = 0;
+                        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(c.Rip, &base, nullptr);
+                        if (!fn)
+                            break;
+                        void* handlerData;
+                        DWORD64 frame;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, fn, &c, &handlerData, &frame, nullptr);
+                    }
+                    fprintf(stderr, "%s\n", line);
+                    s_traceLogged++;
+                }
+                DWORD old;
+                VirtualProtect(reinterpret_cast<void*>(s_tracePage), 0x1000, PAGE_READWRITE, &old);
+                ep->ContextRecord->EFlags |= 0x100;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if (code == EXCEPTION_SINGLE_STEP && s_tracePage)
+            {
+                DWORD old;
+                VirtualProtect(reinterpret_cast<void*>(s_tracePage), 0x1000, PAGE_READONLY, &old);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        bool TraceGuestWritesFromEnv()
+        {
+            const char* v = std::getenv("NFSMW_TRACE_GUEST_ADDR");
+            if (!v || !v[0])
+                return false;
+            char* end = nullptr;
+            const uint32_t addr = uint32_t(std::strtoul(v, &end, 16));
+            const uint32_t bytes = (end && *end == ',') ? uint32_t(std::strtoul(end + 1, nullptr, 16)) : 4u;
+            s_traceLo = uintptr_t(g_memory.base) + addr;
+            s_traceHi = s_traceLo + bytes;
+            s_tracePage = s_traceLo & ~uintptr_t(0xFFF);
+            AddVectoredExceptionHandler(1, TraceVeh);
+            const BOOL ok = VirtualProtect(reinterpret_cast<void*>(s_tracePage), 0x1000, PAGE_READONLY, &s_traceOldProtect);
+            fprintf(stderr, "[trace] watching guest %08X+%X (protect %s, error %lu, previous protection %lX)\n", addr, bytes, ok ? "ok" : "failed", ok ? 0ul : GetLastError(), s_traceOldProtect);
+            return true;
+        }
+#endif
 
         const video::VulkanContext* s_vk = nullptr;
         VkDevice s_dev = VK_NULL_HANDLE;
@@ -1612,6 +1681,51 @@ namespace gpu::renderer
             return PixelShaderSkip{ true, hash };
         }();
 
+        // Pixel shaders the renderer can alter (a table, so a replacement can
+        // join the blur's off switch). The blur pass ps_d52a5eb6c17f9598 is the
+        // full-screen filter that also composites the scene, so it is patched
+        // in place and never skipped: the weight of its neighbouring taps is
+        // forced to 0. Matched by the hash of the shader's microcode (the
+        // game's data: stable across SpeedBreaker updates, different in
+        // another game build) and only when its weight statement is found.
+        struct ShaderOverride
+        {
+            uint64_t hash;
+            std::string_view name;
+            std::string_view find;
+            std::string_view replaceOff;
+        };
+        constexpr ShaderOverride kShaderOverrides[] = {
+            { 0xd52a5eb6c17f9598ull, "motion blur", "vec4 vres = (xmul(r[1].xxxx, r[0].yyyy) + r[0].xxxx);", "vec4 vres = vec4(0.0);" },
+        };
+        constexpr uint32_t kPipelineVariantMotionBlurOff = 1;
+        int32_t s_motionBlurSetting = settings::kMotionBlurOriginal;
+
+        const ShaderOverride* FindShaderOverride(uint64_t hash)
+        {
+            for (const ShaderOverride& o : kShaderOverrides)
+                if (o.hash == hash)
+                    return &o;
+            return nullptr;
+        }
+
+        std::string PatchedPixelShaderGlsl(const Shader& ps, uint32_t variant)
+        {
+            const ShaderOverride* o = (variant & kPipelineVariantMotionBlurOff) ? FindShaderOverride(ps.hash) : nullptr;
+            if (!o)
+                return ps.info.glsl;
+            std::string glsl = ps.info.glsl;
+            const size_t pos = glsl.find(o->find);
+            if (pos == std::string::npos)
+            {
+                fprintf(stderr, "[renderer] %.*s: expected statement not found in ps_%016llx, left as is\n", int(o->name.size()), o->name.data(),
+                    (unsigned long long)ps.hash);
+                return glsl;
+            }
+            glsl.replace(pos, o->find.size(), o->replaceOff);
+            return glsl;
+        }
+
         Shader* DepthOnlyPixelShader()
         {
             static Shader* const ps = [] {
@@ -1934,9 +2048,9 @@ namespace gpu::renderer
             return vs.module;
         }
 
-        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
+        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, uint32_t variant)
         {
-            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0);
+            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | ((variant & 0xF) << 21);
             std::lock_guard lock(ps.compileMutex);
             auto it = ps.variants.find(key);
             if (it != ps.variants.end())
@@ -1951,7 +2065,7 @@ namespace gpu::renderer
             if (alphaTest)
                 preamble += "#define ALPHA_TEST\n";
             std::string log;
-            auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble);
+            auto spirv = CompileGlsl(PatchedPixelShaderGlsl(ps, variant), GLSLANG_STAGE_FRAGMENT, log, preamble);
             VkShaderModule module = VK_NULL_HANDLE;
             if (spirv.empty())
                 fprintf(stderr, "[renderer] ps_%016llx (variant %x): GLSL compile failed:\n%s\n",
@@ -2372,6 +2486,7 @@ namespace gpu::renderer
                 s_renderScale = WantedRenderScale(setting, regionW, regionH);
             }
             s_shadowResolutionSetting = settings::GetInt(settings::Id::ShadowResolution);
+            s_motionBlurSetting = settings::GetInt(settings::Id::MotionBlur);
             s_shadowScale = gpu::ShadowScale(uint32_t(s_shadowResolutionSetting));
             if (const char* v = std::getenv("NFSMW_SCALE_PITCH"))
                 sscanf(v, "%u-%u", &s_scalePitchMin, &s_scalePitchMax);
@@ -3013,7 +3128,7 @@ namespace gpu::renderer
                     outputs |= 1u << i;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
             uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
+            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, key.pad);
             if (!psModule)
                 return VK_NULL_HANDLE;
             stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -8635,6 +8750,7 @@ void main()
                     ApplyMipmaps(mips);
             }
             const int32_t shadowSetting = settings::GetInt(settings::Id::ShadowResolution);
+            s_motionBlurSetting = settings::GetInt(settings::Id::MotionBlur);
             if (shadowSetting != s_shadowResolutionSetting)
                 ApplyShadowResolution(shadowSetting);
             if (s_scaleFixed)
@@ -9594,6 +9710,8 @@ void main()
             gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs);
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
+        // A pixel shader the renderer alters gets its own pipeline (PixelVariant).
+        key.pad = (s_motionBlurSetting == settings::kMotionBlurOff && FindShaderOverride(s_ps->hash)) ? kPipelineVariantMotionBlurOff : 0u;
 
         bool pipelinePending;
         VkPipeline pipeline = GetPipeline(key, layout.pipeline, pipelinePending);
@@ -9761,6 +9879,68 @@ void main()
                         }
                     }
                 fprintf(stderr, "\n");
+            }
+        }
+
+        // NFSMW_LOG_PS_CONSTS=<hex hash>: the used float constants of that
+        // pixel shader, as registers (not packed slots), on every 15th frame.
+        {
+            static const PixelShaderSkip logPsConsts = [] {
+                const char* v = std::getenv("NFSMW_LOG_PS_CONSTS");
+                if (!v || !v[0])
+                    return PixelShaderSkip{};
+                return PixelShaderSkip{ true, std::strtoull(v, nullptr, 16) };
+            }();
+            static uint64_t lastLogged = ~0ull;
+            if (logPsConsts.enabled && s_ps->hash == logPsConsts.hash && s_frame % 15 == 0 && s_frame != lastLogged)
+            {
+                lastLogged = s_frame;
+                static const auto t0 = std::chrono::steady_clock::now();
+                fprintf(stderr, "[psconst] t=%.2fs speed(row)=%.1f speed(col)=%.1f m/s frame %llu ps_%016llx:",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), g_diagCarSpeedRow.exchange(0.0f),
+                    g_diagCarSpeedCol.exchange(0.0f), (unsigned long long)s_frame, (unsigned long long)s_ps->hash);
+                for (uint32_t q = 0; q < 4; q++)
+                    for (uint64_t bits = s_ps->info.constUsed[q]; bits; bits &= bits - 1)
+                    {
+                        const uint32_t reg = q * 64 + uint32_t(__builtin_ctzll(bits));
+                        const uint32_t* v = &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (256 + reg) * 4];
+                        float f[4];
+                        memcpy(f, v, sizeof(f));
+                        fprintf(stderr, " c%u=(%.5f %.5f %.5f %.5f)", reg, f[0], f[1], f[2], f[3]);
+                    }
+                fprintf(stderr, "\n");
+#ifdef _WIN32
+                // NFSMW_TRACE_GUEST_ADDR=<hex addr>[,<bytes>]: logs the host code
+                // (as RVAs in the exe, for the link map) that writes that guest
+                // range, with a few callers.
+                static const bool traceInstalled = TraceGuestWritesFromEnv();
+                (void)traceInstalled;
+#endif
+                // NFSMW_DUMP_GUEST=<hex addr>[,<words>]: that guest memory as
+                // big-endian floats (hex), logged with each constants line.
+                static const std::pair<uint32_t, uint32_t> dump = [] {
+                    const char* v = std::getenv("NFSMW_DUMP_GUEST");
+                    if (!v || !v[0])
+                        return std::pair<uint32_t, uint32_t>{ 0, 0 };
+                    char* end = nullptr;
+                    const uint32_t addr = uint32_t(std::strtoul(v, &end, 16));
+                    const uint32_t words = (end && *end == ',') ? uint32_t(std::strtoul(end + 1, nullptr, 10)) : 64u;
+                    return std::pair<uint32_t, uint32_t>{ addr, words };
+                }();
+                if (dump.second)
+                {
+                    fprintf(stderr, "[dump] frame %llu %08X:", (unsigned long long)s_frame, dump.first);
+                    for (uint32_t i = 0; i < dump.second; i++)
+                    {
+                        uint32_t w;
+                        memcpy(&w, g_memory.base + dump.first + i * 4, 4);
+                        w = __builtin_bswap32(w);
+                        float f;
+                        memcpy(&f, &w, 4);
+                        fprintf(stderr, " %X:%08X(%g)", i * 4, w, f);
+                    }
+                    fprintf(stderr, "\n");
+                }
             }
         }
 

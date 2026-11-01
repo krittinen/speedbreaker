@@ -102,3 +102,17 @@ addresses. To skip every draw using a particular pixel shader, relaunch with
 `NFSMW_SKIP_PS=<hex-hash>` (the hash after `ps_` in a `[draws]` line). This is
 a diagnostic override; a shader shared by multiple effects will be skipped
 in all of them.
+
+The Motion Blur setting (Settings > Graphics, `NFSMW_MOTION_BLUR=off` for one
+run) switches off the full-screen filter pass `ps_d52a5eb6c17f9598`'s blur: it
+forces that shader's per-pixel blend weight to 0 (dropping the
+neighbouring-tap contribution) while the rest of the draw, which also
+composites the scene, still runs. The shaders it can alter are the
+`kShaderOverrides` table in `runtime/gpu/renderer.cpp`, matched by the hash of
+the shader's microcode; an entry logs a message and leaves the shader as is if
+its expected GLSL statement isn't found. `NFSMW_LOG_PS_CONSTS=<hex-hash>`
+logs that shader's used constants every 15th frame, with the fastest car's
+speed (`NFSMW_LOG_C5=1` logs the command-processor writes carrying a nonzero
+blur strength; `NFSMW_DUMP_GUEST=<hex-addr>[,<words>]` dumps guest memory
+beside it; `NFSMW_TRACE_GUEST_ADDR=<hex-addr>[,<hex-bytes>]` logs the host
+code that writes a guest range, on Windows).
