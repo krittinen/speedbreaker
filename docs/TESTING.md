@@ -93,3 +93,12 @@ beta `[build] SpeedBreaker v<version> Windows beta <date> (<commit>): built
 ...`, also shown at the bottom of Settings > Advanced), whether this version
 is new since the last run (`[version] updated from v<a> to v<b>`, or `first
 run`), and describe the machine (`[system] ...`).
+
+## Pixel shader diagnostics
+
+To identify a draw's pixel shader, launch with `NFSMW_LOG_DRAWS=<seconds>`:
+the log records one frame's draws, pixel-shader hashes and sampled texture
+addresses. To skip every draw using a particular pixel shader, relaunch with
+`NFSMW_SKIP_PS=<hex-hash>` (the hash after `ps_` in a `[draws]` line). This is
+a diagnostic override; a shader shared by multiple effects will be skipped
+in all of them.

@@ -40,9 +40,11 @@
 #include <glslang/Public/resource_limits_c.h>
 
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -1586,6 +1588,29 @@ namespace gpu::renderer
         // v0.1.2 (A/B only).
         constexpr uint64_t kDepthOnlyPsHash = 0xDE97400000000001ull;  // (a guest shader hashing to it: a 2^-64 chance)
         const bool s_depthOnlyGuestPs = [] { const char* v = std::getenv("NFSMW_DEPTH_ONLY_PS"); return v && v[0] == '1'; }();
+
+        struct PixelShaderSkip
+        {
+            bool enabled = false;
+            uint64_t hash = 0;
+        };
+        // NFSMW_SKIP_PS=<hex hash>: skip draws using this pixel shader. Find
+        // the hash in an [draws] line from NFSMW_LOG_DRAWS=<seconds>.
+        const PixelShaderSkip s_skipPixelShader = [] {
+            const char* v = std::getenv("NFSMW_SKIP_PS");
+            if (!v || !v[0])
+                return PixelShaderSkip{};
+            char* end = nullptr;
+            errno = 0;
+            const uint64_t hash = std::strtoull(v, &end, 16);
+            if (errno == ERANGE || end == v || *end)
+            {
+                fprintf(stderr, "[renderer] NFSMW_SKIP_PS must be a hexadecimal pixel shader hash\n");
+                return PixelShaderSkip{};
+            }
+            fprintf(stderr, "[renderer] NFSMW_SKIP_PS: skipping draws using ps_%016llx\n", (unsigned long long)hash);
+            return PixelShaderSkip{ true, hash };
+        }();
 
         Shader* DepthOnlyPixelShader()
         {
@@ -9219,6 +9244,9 @@ void main()
         auto viz = Reg<reg::PA_SC_VIZ_QUERY>();
         if (viz.viz_query_ena && viz.kill_pix_post_hi_z)
             return;
+
+        if (s_skipPixelShader.enabled && s_ps->hash == s_skipPixelShader.hash)
+            return skip((0x50ull << 56) ^ s_skipPixelShader.hash, "pixel shader matched NFSMW_SKIP_PS");
 
         auto surface = Reg<reg::RB_SURFACE_INFO>();
         uint32_t pitch = surface.surface_pitch;
