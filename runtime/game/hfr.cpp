@@ -1518,8 +1518,10 @@ SB_HOOK(sub_8243EAC0)
     const uint32_t matrices = ctx.r3.u32;
     SB_ORIGINAL(sub_8243EAC0)(ctx, base);
     // The player's view (id 1) lays out its matrices at the first argument:
-    // view +0, projection +64, view-projection +128 (16 floats each).
-    if (matrices && PPC_LOAD_U32(view + 4) == 1)
+    // view +0, projection +64, view-projection +128 (16 floats each). Only the
+    // per-object motion blur uses them (and the car list below): with another
+    // Motion Blur setting none of this is read or kept.
+    if (matrices && PPC_LOAD_U32(view + 4) == 1 && settings::GetInt(settings::Id::MotionBlur) == settings::kMotionBlurPerObject)
     {
         motionvectors::Matrix v, vp;
         Load(base, matrices, v.data());

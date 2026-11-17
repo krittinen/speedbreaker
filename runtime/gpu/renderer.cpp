@@ -8732,18 +8732,24 @@ void main()
             return dropped;
         }
 
+        // The velocity target (per-object motion blur) is dropped when the render scale changes (it is made at the
+        // scale) and when the setting goes to another mode (the GPU idle: the caller flushed).
+        void ReleaseVelocityTarget()
+        {
+            if (!s_velocityTarget)
+                return;
+            std::erase_if(s_pendingClears, [&](const PendingClear& pc) { return pc.rt == s_velocityTarget.get(); });
+            DestroyTarget(*s_velocityTarget);
+            s_velocityTarget.reset();
+        }
+
         void ApplyRenderScale(const gpu::RenderScale& scale, const std::string& how)
         {
             auto start = std::chrono::steady_clock::now();
             const gpu::RenderScale old = s_renderScale;
             Flush();
             s_renderScale = scale;
-            if (s_velocityTarget)
-            {
-                std::erase_if(s_pendingClears, [&](const PendingClear& pc) { return pc.rt == s_velocityTarget.get(); });
-                DestroyTarget(*s_velocityTarget);
-                s_velocityTarget.reset();
-            }
+            ReleaseVelocityTarget();
             s_shadowTargetsByResolve.clear();
             PrewarmResolvePipelines(scale);
             if (scale != s_shadowScale)
@@ -8870,7 +8876,13 @@ void main()
                     ApplyMipmaps(mips);
             }
             const int32_t shadowSetting = settings::GetInt(settings::Id::ShadowResolution);
-            s_motionBlurSetting = settings::GetInt(settings::Id::MotionBlur);
+            const int32_t blurSetting = settings::GetInt(settings::Id::MotionBlur);
+            if (blurSetting != settings::kMotionBlurPerObject && s_velocityTarget)
+            {
+                Flush();
+                ReleaseVelocityTarget();
+            }
+            s_motionBlurSetting = blurSetting;
             if (shadowSetting != s_shadowResolutionSetting)
                 ApplyShadowResolution(shadowSetting);
             if (s_scaleFixed)
@@ -9623,7 +9635,7 @@ void main()
         // The scene's depth surface is at EDRAM tile 1024 in most pictures; at 30 fps the game also draws it at 1312 and 1328
         // (the same 1280-wide colour surface at tile 0), and, with 2x multisampling (low speeds at 30 fps), in two 640-wide tiles
         // from tile 1312, which the renderer draws side by side.
-        const bool sceneSurfaces = depth &&
+        const bool sceneSurfaces = VelocityWanted() && depth &&
             (((depth->base == 1024 || depth->base == 1312 || depth->base == 1328) && depth->pitch == 1280) ||
                 (depth->base == 1312 && depth->pitch == 640 && surface.msaa_samples != xenos::MsaaSamples::k1X)) &&
             (!color[0] || (!color[0]->depth && color[0]->base == 0 && color[0]->pitch == depth->pitch));
@@ -9897,7 +9909,7 @@ void main()
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
         // A pixel shader the renderer alters gets its own pipeline (PixelVariant).
-        key.pad = FindShaderOverride(s_ps->hash)
+        key.pad = s_motionBlurSetting != settings::kMotionBlurOriginal && FindShaderOverride(s_ps->hash)
             ? (s_motionBlurSetting == settings::kMotionBlurOff ? kPipelineVariantMotionBlurOff : 0u) |
                 (s_motionBlurSetting == settings::kMotionBlurPerObject ? kPipelineVariantPerObjectBlur : 0u)
             : 0u;
