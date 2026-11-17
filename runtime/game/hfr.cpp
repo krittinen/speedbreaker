@@ -45,6 +45,7 @@
 #include "hfr_blend.h"
 #include "hfr_grid.h"
 #include "frame_time.h"
+#include <gpu/motion_vectors.h>
 
 #include <kernel/function.h>
 #include <kernel/write_watch.h>
@@ -1438,6 +1439,64 @@ SB_HOOK(sub_824E9C38)
     car.step = Step(base);
 }
 
+// The vertex buffers of the parts a car is built from: its CarRenderInfo's part table (+0xB78: a model per slot,
+// model and level of detail, each an eModel whose word 3 points to its eSolid) and the address blocks those solids
+// occupy (a solid's block runs to the next solid in its list). A draw whose vertex buffers fall in a car's blocks
+// is a part of that car. The result is rebuilt only when the car's set of solids changes (the player's
+// customization, a level of detail the game loads): sorted, merged (low, high) pairs of guest physical addresses.
+static std::shared_ptr<const std::vector<uint32_t>> CarPartBuffers(uint8_t* base, uint32_t object)
+{
+    static std::unordered_map<uint32_t, std::pair<uint64_t, std::shared_ptr<const std::vector<uint32_t>>>> cars;
+    const uint32_t info = PPC_LOAD_U32(object + 68);
+    if (!info)
+        return nullptr;
+    auto plausible = [](uint32_t p) { return p >= 0x10000000 && p < 0xC0000000 && (p & 3) == 0; };
+    std::vector<uint32_t> solids;
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 380; i++)
+    {
+        const uint32_t model = PPC_LOAD_U32(info + 0xB78 + i * 4) & ~3u;
+        if (!plausible(model) || !PPC_LOAD_U32(model + 8))
+            continue;
+        const uint32_t solid = PPC_LOAD_U32(model + 12);
+        if (!plausible(solid))
+            continue;
+        solids.push_back(solid);
+        hash = (hash ^ solid) * 1099511628211ull;
+    }
+    if (solids.empty())
+        return nullptr;
+    auto& cached = cars[object];
+    if (cached.second && cached.first == hash)
+        return cached.second;
+    std::sort(solids.begin(), solids.end());
+    solids.erase(std::unique(solids.begin(), solids.end()), solids.end());
+    auto all = std::make_shared<std::vector<uint32_t>>();
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    for (const uint32_t solid : solids)
+    {
+        // A solid owns its block: up to the next solid in its list (they are laid out one after the other).
+        const uint32_t next = PPC_LOAD_U32(solid + 4) - 4;
+        uint32_t size = 0x80000;
+        if (next > solid && next - solid <= 0x100000)
+            size = next - solid;
+        ranges.emplace_back(solid & 0x1FFFFFFF, (solid & 0x1FFFFFFF) + size);
+    }
+    std::sort(ranges.begin(), ranges.end());
+    for (const auto& r : ranges)
+    {
+        if (!all->empty() && r.first <= all->back())
+            all->back() = std::max(all->back(), r.second);
+        else
+        {
+            all->push_back(r.first);
+            all->push_back(r.second);
+        }
+    }
+    cached = { hash, all };
+    return all;
+}
+
 // A view setup: records the camera each view of the real picture used.
 extern "C" PPC_FUNC(__imp__sub_8243EAC0);
 SB_HOOK(sub_8243EAC0)
@@ -1456,7 +1515,47 @@ SB_HOOK(sub_8243EAC0)
             c.step = Step(base);
         }
     hfrdiag::OnViewSetup(base, view);
+    const uint32_t matrices = ctx.r3.u32;
     SB_ORIGINAL(sub_8243EAC0)(ctx, base);
+    // The player's view (id 1) lays out its matrices at the first argument:
+    // view +0, projection +64, view-projection +128 (16 floats each).
+    if (matrices && PPC_LOAD_U32(view + 4) == 1)
+    {
+        motionvectors::Matrix v, vp;
+        Load(base, matrices, v.data());
+        Load(base, matrices + 128, vp.data());
+        // The vehicle render list (the same one hfr_diag reads): render objects, count.
+        std::vector<motionvectors::Vehicle> vehicles;
+        const uint32_t items = PPC_LOAD_U32(0x82C84D3C), count = PPC_LOAD_U32(0x82C84D44);
+        if (items && count < 64)
+            for (uint32_t i = 0; i < count; i++)
+                if (const uint32_t object = PPC_LOAD_U32(items + i * 4))
+                {
+                    motionvectors::Vehicle car;
+                    car.id = object;
+                    Load(base, object + kCarMatrix, car.world.data());
+                    // An object not yet placed has no position: nothing to draw.
+                    if (car.world[12] == 0.0f && car.world[13] == 0.0f && car.world[14] == 0.0f)
+                        continue;
+                    float wheels[4][3], radius = 0.0f;
+                    for (int w = 0; w < 4; w++)
+                    {
+                        for (int k = 0; k < 3; k++)
+                        {
+                            const uint32_t raw = PPC_LOAD_U32(object + 144 + w * 16 + k * 4);
+                            memcpy(&wheels[w][k], &raw, 4);
+                        }
+                        const uint32_t raw = PPC_LOAD_U32(object + 208 + w * 4);
+                        float r;
+                        memcpy(&r, &raw, 4);
+                        radius = std::max(radius, r);
+                    }
+                    motionvectors::BoxFromWheels(wheels, radius, car);
+                    car.buffers = CarPartBuffers(base, object);
+                    vehicles.push_back(car);
+                }
+        motionvectors::Publish(v, vp, std::move(vehicles));
+    }
 }
 
 // A camera's update (sub_82161000: keeps its last pose at +224 and derives

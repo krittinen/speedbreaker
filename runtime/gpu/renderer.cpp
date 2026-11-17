@@ -12,6 +12,8 @@
 #include "covers.h"
 #include "edge_bars.h"
 #include "memory_plan.h"
+#include "motion_vectors.h"
+#include "command_processor.h"
 #include "pipeline_cache_header.h"
 #include "shader_translator.h"
 #include "zpd_report.h"
@@ -352,8 +354,12 @@ namespace gpu::renderer
         VkDeviceSize s_ringOffset = 0;
 
         // XenosConstants (shader_translator.cpp): c[512], fetch[48], bools[2],
-        // loops[8], drawInfo[4], each a vec4/uvec4.
-        constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 4) * 16;
+        // loops[8], drawInfo[8], each a vec4/uvec4. drawInfo is zero except for
+        // a vehicle's draw (the motion vectors): [0..3] the reprojection
+        // matrix, [4] the guest clip position of a fragment from
+        // gl_FragCoord (x scale, y scale, x offset, y offset), as floats.
+        constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 8) * 16;
+        constexpr uint32_t kDrawInfoSlot = 570;
 
         // Image memory. Images are bound at offsets into blocks of device
         // memory (64 MB; gpu/block_ranges.h keeps each block's free ranges),
@@ -1587,6 +1593,215 @@ namespace gpu::renderer
         constexpr uint64_t kDepthOnlyPsHash = 0xDE97400000000001ull;  // (a guest shader hashing to it: a 2^-64 chance)
         const bool s_depthOnlyGuestPs = [] { const char* v = std::getenv("NFSMW_DEPTH_ONLY_PS"); return v && v[0] == '1'; }();
 
+        // Pixel shaders the renderer can alter (a table, so a replacement can
+        // join the blur's off switch). The blur pass ps_d52a5eb6c17f9598 is the
+        // full-screen filter that also composites the scene, so it is patched
+        // in place and never skipped: the weight of its neighbouring taps is
+        // forced to 0. Matched by the hash of the shader's microcode (the
+        // game's data: stable across SpeedBreaker updates, different in
+        // another game build) and only when its weight statement is found.
+        struct ShaderOverride
+        {
+            uint64_t hash;
+            std::string_view name;
+            std::string_view find;
+            std::string_view replaceOff;
+        };
+        constexpr ShaderOverride kShaderOverrides[] = {
+            { 0xd52a5eb6c17f9598ull, "motion blur", "vec4 vres = (xmul(r[1].xxxx, r[0].yyyy) + r[0].xxxx);", "vec4 vres = vec4(0.0);" },
+        };
+        constexpr uint32_t kPipelineVariantMotionBlurOff = 1;
+        constexpr uint32_t kPipelineVariantPerObjectBlur = 8;  // the blur pass blurs along the motion vectors instead
+        constexpr uint32_t kPipelineVariantVehicleVelocity = 4;  // writes the vehicle's velocity to colour output 3
+        int32_t s_motionBlurSetting = settings::kMotionBlurOriginal;
+        // The motion vectors are wanted (Motion Blur: Per-object).
+        inline bool VelocityWanted()
+        {
+            return s_motionBlurSetting == settings::kMotionBlurPerObject;
+        }
+
+        // The per-object blur reads the picture's reprojection matrix (gpu/motion_vectors.h) from four pixel
+        // constants past those the shader uses, and the velocity target (the vehicles' and props' own motion) as a texture.
+        constexpr uint32_t kVelocityConstants = 64;  // pixel constant slot of the matrix' first row
+
+        constexpr std::string_view kVelocityTextureDeclaration =
+            "layout(set = 1, binding = 31) uniform sampler2D sbVelocityTex;\n";
+        constexpr uint32_t kVelocityTextureBinding = 31;  // (the guest's fetch slots end at 15)
+
+        // The per-object blur (Motion Blur: Per-object), in place of the blur pass's own. A
+        // pixel's motion is the vehicles' velocity where a vehicle's draw wrote it, else the
+        // camera's from its depth; the strongest motion of a nearer
+        // object within a few pixels takes over (so a fast object's blur spreads over the edge of
+        // its silhouette); the picture is then sampled along that motion, as far as the shutter
+        // is open, the length capped, skipping what is in front of the pixel.
+        constexpr std::string_view kPerObjectBlurHelpers = R"GLSL(
+vec2 sbVelocityAt(vec2 sbUv, out float sbDepth)
+{
+    sbDepth = texture(t2d_4, sbUv).x;
+    // An empty depth copy (some pictures' copy is all zero) would give every pixel the near
+    // plane's motion; the far plane's (the camera's turn) is the better guess.
+    float sbUsed = sbDepth > 0.0 ? sbDepth : 0.995;
+    vec2 sbNdc = vec2(sbUv.x * 2.0 - 1.0, 1.0 - sbUv.y * 2.0);
+    vec4 sbPrev = sbNdc.x * u.c[pc.psConstBase + 64u] + sbNdc.y * u.c[pc.psConstBase + 65u] +
+        sbUsed * u.c[pc.psConstBase + 66u] + u.c[pc.psConstBase + 67u];
+    vec2 sbVelocity = abs(sbPrev.w) > 1e-6 ? (sbPrev.xy / sbPrev.w - sbNdc) * vec2(0.5, -0.5) : vec2(0.0);
+    if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+    ivec2 sbSize = textureSize(sbVelocityTex, 0);
+    ivec2 sbTexel = min(ivec2(sbUv * vec2(float(sbSize.x), float(sbSize.y) * 0.703125)), sbSize - 1);
+    vec4 sbObject = texelFetch(sbVelocityTex, sbTexel, 0);
+    if (sbObject.x < 100.0)
+    {
+        // An object's own motion below a few pixels (a chased car's bounce against the camera) is no
+        // blur; it ramps in over a few pixels more.
+        float sbPixels = length(sbObject.xy * fetchSize2D(4u));
+        sbVelocity = sbObject.xy * smoothstep(%KNEE0%, %KNEE1%, sbPixels);
+    }
+    if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+    return sbVelocity;
+}
+)GLSL";
+        constexpr std::string_view kPerObjectBlurFind = "vec4 vres = (xmul(r[5].xyzz, r[0].xxxx) + r[3].xyzz);";
+        // %SHUTTER% (the part of the picture's time the shutter is open) and %MAXPIXELS% (the
+        // longest blur, in pixels of the 1280x720 picture) are put in when the variant is built.
+        constexpr std::string_view kPerObjectBlurReplace = R"GLSL(vec4 vres = (xmul(r[5].xyzz, r[0].xxxx) + r[3].xyzz);
+#ifdef IN0
+        {
+            const float sbShutter = %SHUTTER%;
+            const float sbMaxPixels = %MAXPIXELS%;
+            vec2 sbUv = i_i0.xy;
+            vec2 sbPictureSize = fetchSize2D(4u);
+            float sbDepth0;
+            vec2 sbV = sbVelocityAt(sbUv, sbDepth0);
+            float sbReach = min(sbMaxPixels * 0.5, 14.0);
+            for (int sbI = 0; sbI < 8; sbI++)
+            {
+                float sbAngle = float(sbI) * 0.78539816;
+                float sbDepthN;
+                vec2 sbVn = sbVelocityAt(sbUv + vec2(cos(sbAngle), sin(sbAngle)) * sbReach / sbPictureSize, sbDepthN);
+                vec2 sbA = sbVn * sbPictureSize, sbB = sbV * sbPictureSize;
+                if ((1.0 - sbDepthN) > (1.0 - sbDepth0) * 1.08 && dot(sbA, sbA) > dot(sbB, sbB)) sbV = sbVn;
+            }
+            float sbLength = length(sbV * sbPictureSize);
+            if (sbLength > sbMaxPixels)
+            {
+                sbV *= sbMaxPixels / sbLength;
+                sbLength = sbMaxPixels;
+            }
+            vres.xyz = r[3].xyz;
+            if (sbLength >= 0.75)
+            {
+                sbV *= sbShutter;
+                int sbN = clamp(int(sbLength * sbShutter * 0.5) + 3, 4, 16);
+                float sbJitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5;
+                vec3 sbSum = vec3(0.0);
+                float sbWeight = 0.0;
+                for (int sbI = 0; sbI < 16; sbI++)
+                {
+                    if (sbI >= sbN) break;
+                    vec2 sbS = sbUv + sbV * ((float(sbI) + 0.5 + sbJitter) / float(sbN) - 0.5);
+                    float sbDepthS = texture(t2d_4, sbS).x;
+                    // A sample of something nearer (the car in front of the road) is left out, not
+                    // replaced by this pixel's colour: that kept a sharp band along the car's edge.
+                    if (sbDepth0 > 0.0 && sbDepthS > 0.0 && (1.0 - sbDepthS) > (1.0 - sbDepth0) * 1.08) continue;
+                    sbSum += texture(t2d_0, sbS, fetchLodBias(0u)).xyz;
+                    sbWeight += 1.0;
+                }
+                vres.xyz = sbWeight > 0.0 ? sbSum / sbWeight : r[3].xyz;
+            }
+        }
+#endif)GLSL";
+
+        std::string PerObjectBlurHelpers()
+        {
+            constexpr float knee = 6.0f;
+            std::string s(kPerObjectBlurHelpers);
+            auto put = [&](const char* key, float value) {
+                const size_t pos = s.find(key);
+                if (pos != std::string::npos)
+                    s.replace(pos, std::strlen(key), std::format("{:.2f}", value));
+            };
+            put("%KNEE0%", knee);
+            put("%KNEE1%", knee * 2.3f + 0.01f);
+            return s;
+        }
+
+        std::string PerObjectBlurReplacement()
+        {
+            constexpr float shutter = 0.6f;
+            constexpr float maxPixels = 40.0f;
+            std::string s(kPerObjectBlurReplace);
+            auto put = [&](const char* key, float value) {
+                const size_t pos = s.find(key);
+                if (pos != std::string::npos)
+                    s.replace(pos, std::strlen(key), std::format("{:.3f}", value));
+            };
+            put("%SHUTTER%", shutter);
+            put("%MAXPIXELS%", maxPixels);
+            return s;
+        }
+
+        // A vehicle's draw writes its own velocity to colour output 3, the
+        // host-only velocity target (kPipelineVariantVehicleVelocity): the
+        // fragment's guest NDC from gl_FragCoord (constants drawInfo[4]), its
+        // depth, and the draw's reprojection (drawInfo[0..3]), as the blur
+        // pass does for the camera.
+        constexpr std::string_view kVehicleVelocityFind = "o_c3 = o_color[3];";
+        constexpr std::string_view kVehicleVelocityReplace = R"GLSL({
+        if (u.drawInfo[5].x != 0u)
+            o_c3 = vec4(1000.0, 0.0, 0.0, 0.0);
+        else {
+        vec4 sbMap = uintBitsToFloat(u.drawInfo[4]);
+        vec2 sbNdc = gl_FragCoord.xy * sbMap.xy + sbMap.zw;
+        vec4 sbPrev = sbNdc.x * uintBitsToFloat(u.drawInfo[0]) + sbNdc.y * uintBitsToFloat(u.drawInfo[1]) +
+            gl_FragCoord.z * uintBitsToFloat(u.drawInfo[2]) + uintBitsToFloat(u.drawInfo[3]);
+        vec2 sbVelocity = abs(sbPrev.w) > 1e-6 ? (sbPrev.xy / sbPrev.w - sbNdc) * vec2(0.5, -0.5) : vec2(0.0);
+        if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+        o_c3 = vec4(sbVelocity, 0.0, 0.0);
+        }
+    })GLSL";
+
+        const ShaderOverride* FindShaderOverride(uint64_t hash)
+        {
+            for (const ShaderOverride& o : kShaderOverrides)
+                if (o.hash == hash)
+                    return &o;
+            return nullptr;
+        }
+
+        std::string PatchedPixelShaderGlsl(const Shader& ps, uint32_t variant)
+        {
+            const ShaderOverride* o = (variant & (kPipelineVariantMotionBlurOff | kPipelineVariantPerObjectBlur)) ? FindShaderOverride(ps.hash) : nullptr;
+            if (!o && !(variant & kPipelineVariantVehicleVelocity))
+                return ps.info.glsl;
+            std::string glsl = ps.info.glsl;
+            auto patch = [&](std::string_view find, std::string_view replace) {
+                const size_t pos = glsl.find(find);
+                if (pos == std::string::npos)
+                    fprintf(stderr, "[renderer] ps_%016llx: expected statement not found for a variant, left as is: %.*s\n",
+                        (unsigned long long)ps.hash, int(find.size()), find.data());
+                else
+                    glsl.replace(pos, find.size(), replace);
+            };
+            if (o && (variant & kPipelineVariantMotionBlurOff))
+                patch(o->find, o->replaceOff);
+            if (o && (variant & kPipelineVariantPerObjectBlur))
+            {
+                const size_t main = glsl.rfind("void main()");
+                if (main != std::string::npos)
+                    glsl.insert(main, kVelocityTextureDeclaration);
+            }
+            if (o && (variant & kPipelineVariantPerObjectBlur))
+            {
+                const size_t main = glsl.rfind("void main()");
+                if (main != std::string::npos)
+                    glsl.insert(main, PerObjectBlurHelpers());
+                patch(kPerObjectBlurFind, PerObjectBlurReplacement());
+            }
+            if (variant & kPipelineVariantVehicleVelocity)
+                patch(kVehicleVelocityFind, kVehicleVelocityReplace);
+            return glsl;
+        }
+
         Shader* DepthOnlyPixelShader()
         {
             static Shader* const ps = [] {
@@ -1909,9 +2124,9 @@ namespace gpu::renderer
             return vs.module;
         }
 
-        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
+        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, uint32_t variant)
         {
-            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0);
+            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | ((variant & 0x1F) << 21);
             std::lock_guard lock(ps.compileMutex);
             auto it = ps.variants.find(key);
             if (it != ps.variants.end())
@@ -1926,7 +2141,7 @@ namespace gpu::renderer
             if (alphaTest)
                 preamble += "#define ALPHA_TEST\n";
             std::string log;
-            auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble);
+            auto spirv = CompileGlsl(PatchedPixelShaderGlsl(ps, variant), GLSLANG_STAGE_FRAGMENT, log, preamble);
             VkShaderModule module = VK_NULL_HANDLE;
             if (spirv.empty())
                 fprintf(stderr, "[renderer] ps_%016llx (variant %x): GLSL compile failed:\n%s\n",
@@ -1986,24 +2201,27 @@ namespace gpu::renderer
         };
         std::map<std::array<uint32_t, 6>, std::unique_ptr<TextureLayout>> s_textureLayouts;
 
-        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps);
+        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps, uint32_t extraPs2D);
 
-        const TextureLayout& GetTextureLayout(const Shader& vs, const Shader& ps)
+        // `extraPs2D`: 2D texture bindings the renderer adds to the pixel stage (a variant's).
+        const TextureLayout& GetTextureLayout(const Shader& vs, const Shader& ps, uint32_t extraPs2D = 0)
         {
             static const Shader *lastVs = nullptr, *lastPs = nullptr;
+            static uint32_t lastExtra = 0;
             static const TextureLayout* last = nullptr;
-            if (&vs == lastVs && &ps == lastPs)
+            if (&vs == lastVs && &ps == lastPs && extraPs2D == lastExtra)
                 return *last;
             lastVs = &vs;
             lastPs = &ps;
-            last = &GetTextureLayoutUncached(vs, ps);
+            lastExtra = extraPs2D;
+            last = &GetTextureLayoutUncached(vs, ps, extraPs2D);
             return *last;
         }
 
-        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps)
+        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps, uint32_t extraPs2D)
         {
             std::array<uint32_t, 3> v = { vs.info.texture2DMask, vs.info.texture3DMask, vs.info.textureCubeMask };
-            std::array<uint32_t, 3> p = { ps.info.texture2DMask, ps.info.texture3DMask, ps.info.textureCubeMask };
+            std::array<uint32_t, 3> p = { ps.info.texture2DMask | extraPs2D, ps.info.texture3DMask, ps.info.textureCubeMask };
             std::array<uint32_t, 6> key = { v[0], v[1], v[2], p[0], p[1], p[2] };
             auto& slot = s_textureLayouts[key];
             if (slot)
@@ -2347,6 +2565,7 @@ namespace gpu::renderer
                 s_renderScale = WantedRenderScale(setting, regionW, regionH);
             }
             s_shadowResolutionSetting = settings::GetInt(settings::Id::ShadowResolution);
+            s_motionBlurSetting = settings::GetInt(settings::Id::MotionBlur);
             s_shadowScale = gpu::ShadowScale(uint32_t(s_shadowResolutionSetting));
             if (const char* v = std::getenv("NFSMW_SCALE_PITCH"))
                 sscanf(v, "%u-%u", &s_scalePitchMin, &s_scalePitchMax);
@@ -2402,12 +2621,15 @@ namespace gpu::renderer
 #endif
         // A new target, at the current scale if its pitch is a scaled one,
         // cleared to zero (new EDRAM contents).
-        std::unique_ptr<RenderTarget> CreateTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, bool wide)
+        std::unique_ptr<RenderTarget> CreateTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, bool wide,
+            VkFormat forceFormat = VK_FORMAT_UNDEFINED, uint32_t forceRows = 0)
         {
             // Height: whatever fits in EDRAM (2048 tiles of 80x16 32-bit
             // samples) from this base, capped at the 2048-line maximum.
             uint32_t tilesPerRow = std::max(1u, (pitch + 79) / 80) * (!depth && Is64bpp(format) ? 2 : 1);
             uint32_t rows = std::clamp((2048u - std::min(base, 2047u)) / tilesPerRow * 16, 16u, 2048u);
+            if (forceRows)
+                rows = forceRows;
 
             auto rt = std::make_unique<RenderTarget>();
             rt->base = base;
@@ -2425,7 +2647,7 @@ namespace gpu::renderer
             // has room for its last host column.)
             rt->width = rt->scale.x.Size(rt->guestWidth);
             rt->height = rt->scale.y.Size(rt->guestHeight);
-            rt->vkFormat = depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : ColorFormat(format);
+            rt->vkFormat = forceFormat != VK_FORMAT_UNDEFINED ? forceFormat : depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : ColorFormat(format);
             VkFormatProperties fp;
             vkGetPhysicalDeviceFormatProperties(s_vk->physical, rt->vkFormat, &fp);
             rt->blendable = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
@@ -2988,7 +3210,7 @@ namespace gpu::renderer
                     outputs |= 1u << i;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
             uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
+            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, key.pad);
             if (!psModule)
                 return VK_NULL_HANDLE;
             stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -5762,6 +5984,38 @@ void main()
             s_pendingClears.push_back({ rt, rect, ca.clearValue });
         }
 
+        // The vehicles' velocity (the motion vectors of objects, see
+        // kPipelineVariantVehicleVelocity): a host-only target the size of the
+        // scene's (1024 rows: its depth target's), attached as colour 3 of
+        // every draw into the scene, and cleared to "no object" (x = 1000)
+        // by the first of each picture. RG16F: the velocity in texture
+        // coordinates, where a vehicle was drawn.
+        std::unique_ptr<RenderTarget> s_velocityTarget;
+        uint64_t s_velocityClearedPicture = ~0ull;
+
+        RenderTarget* SceneVelocityTarget(bool wide)
+        {
+            if (!s_velocityTarget)
+            {
+                s_velocityTarget = CreateTarget(0, 0, false, 1280, wide, VK_FORMAT_R16G16_SFLOAT, 1024);
+                s_velocityClearedPicture = ~0ull;
+            }
+            RenderTarget* rt = s_velocityTarget.get();
+            const uint64_t picture = gpu::FrameCount();
+            if (s_velocityClearedPicture != picture)
+            {
+                s_velocityClearedPicture = picture;
+                EndPass();
+                Begin();
+                VkClearColorValue none{};
+                none.float32[0] = 1000.0f;
+                VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(s_cmd, rt->image.image, VK_IMAGE_LAYOUT_GENERAL, &none, 1, &range);
+                FullBarrier();
+            }
+            return rt;
+        }
+
         // NFSMW_LOG_SHADOWMAP=1 (diagnostic): every 5 s, the first depth
         // resolve from a surface of pitch 1600 (the sun's shadow map) is
         // copied back after it, and a [shadowmap] line gives the share of its
@@ -8484,6 +8738,12 @@ void main()
             const gpu::RenderScale old = s_renderScale;
             Flush();
             s_renderScale = scale;
+            if (s_velocityTarget)
+            {
+                std::erase_if(s_pendingClears, [&](const PendingClear& pc) { return pc.rt == s_velocityTarget.get(); });
+                DestroyTarget(*s_velocityTarget);
+                s_velocityTarget.reset();
+            }
             s_shadowTargetsByResolve.clear();
             PrewarmResolvePipelines(scale);
             if (scale != s_shadowScale)
@@ -8610,6 +8870,7 @@ void main()
                     ApplyMipmaps(mips);
             }
             const int32_t shadowSetting = settings::GetInt(settings::Id::ShadowResolution);
+            s_motionBlurSetting = settings::GetInt(settings::Id::MotionBlur);
             if (shadowSetting != s_shadowResolutionSetting)
                 ApplyShadowResolution(shadowSetting);
             if (s_scaleFixed)
@@ -9351,6 +9612,71 @@ void main()
                     adoptedDepth ? (adoptedColor ? "colour and depth" : "depth") : "colour");
             }
         }
+        // The vehicles' velocity: every draw into the scene's targets also attaches the velocity target as
+        // colour 3 (a pass restarts when its attachments change), writing it only for a car's or a prop's own
+        // draws, and "not written" for any other opaque draw, which covers the vectors behind it. A car's draw is
+        // one whose vertex buffers are among a listed car's part models (motion_vectors.h); the draw's clip
+        // matrix (its vertex shader's c0-c3: world * view-projection, as columns) gives its motion.
+        int vehicleIndex = -1;
+        bool velocityMarker = false;  // a draw that is not a vehicle's covers its pixels with "not written"
+        motionvectors::Matrix vehicleReprojection = motionvectors::Identity();
+        // The scene's depth surface is at EDRAM tile 1024 in most pictures; at 30 fps the game also draws it at 1312 and 1328
+        // (the same 1280-wide colour surface at tile 0), and, with 2x multisampling (low speeds at 30 fps), in two 640-wide tiles
+        // from tile 1312, which the renderer draws side by side.
+        const bool sceneSurfaces = depth &&
+            (((depth->base == 1024 || depth->base == 1312 || depth->base == 1328) && depth->pitch == 1280) ||
+                (depth->base == 1312 && depth->pitch == 640 && surface.msaa_samples != xenos::MsaaSamples::k1X)) &&
+            (!color[0] || (!color[0]->depth && color[0]->base == 0 && color[0]->pitch == depth->pitch));
+        if (VelocityWanted() && sceneSurfaces && (!color[3] || color[3] == s_velocityTarget.get()) && (writeMask >> 12) == 0)
+        {
+            color[3] = SceneVelocityTarget(depth->wide);
+            const bool opaqueDraw = depthControl.z_write_enable && (s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF) == 0x00010001;
+            if ((writeMask & 0xF) && color[0] && !(adoptedColor & 1) && (s_vs->info.constUsed[0] & 0xF) == 0xF)
+            {
+                motionvectors::Matrix drawClip;
+                for (uint32_t r = 0; r < 4; r++)
+                    for (uint32_t k = 0; k < 4; k++)
+                        memcpy(&drawClip[k * 4 + r], &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + r * 4 + k], 4);
+                uint64_t mesh = (s_vs->hash * 0x9E3779B97F4A7C15ull) ^ (uint64_t(count) << 32) ^ (dmaBase & 0x1FFFFFFF);
+                motionvectors::g_drawBufferCount = 0;
+                motionvectors::g_drawBuffers[motionvectors::g_drawBufferCount++] = uint32_t(dmaBase & 0x1FFFFFFC);
+                for (uint32_t word = 0; word < 3; word++)
+                    for (uint32_t bits = s_vs->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
+                    {
+                        const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (word * 32 + uint32_t(__builtin_ctz(bits))) * 2];
+                        if (motionvectors::g_drawBufferCount < 10)
+                            motionvectors::g_drawBuffers[motionvectors::g_drawBufferCount++] = vf[0] & 0x1FFFFFFC;
+                        mesh = (mesh ^ (vf[0] & 0x1FFFFFFC)) * 0x100000001B3ull;
+                    }
+                motionvectors::Matrix reprojection;
+                // The vertex shaders of a car's parts (the first 8 digits of their hash), and of what is drawn with
+                // them: the wheel shaders (580d1cb7, 4ad5b44a, abfb2daf) also draw trees and props, so they only
+                // get a car's vector inside the car's box. A draw whose buffers are in a listed car's part models
+                // is a car's whatever its shader; any other draw of another shader is not followed.
+                constexpr uint32_t kVehicleShaders[] = { 0xf3cb08fa, 0x31a7fc62, 0x50eb5376, 0x580d1cb7, 0x4ad5b44a, 0xabfb2daf, 0x9fd9f10d };
+                const uint32_t vertexShaderId = uint32_t(s_vs->hash >> 32);
+                const bool vehiclePart = motionvectors::AnyCarOwnsDraw(gpu::FrameCount()) ||
+                    std::find(std::begin(kVehicleShaders), std::end(kVehicleShaders), vertexShaderId) != std::end(kVehicleShaders);
+                motionvectors::g_strictOwnership = vertexShaderId == 0x580d1cb7 || vertexShaderId == 0x4ad5b44a || vertexShaderId == 0xabfb2daf;
+                const motionvectors::DrawMotion motion = !vehiclePart ? motionvectors::DrawMotion::Static : motionvectors::NoteDraw(gpu::FrameCount(), mesh,
+                    (s_vs->hash * 0x9E3779B97F4A7C15ull) ^ (s_ps->hash << 1) ^ (uint64_t(count) << 32), drawClip, reprojection);
+                if (motion == motionvectors::DrawMotion::Moving)
+                {
+                    vehicleReprojection = reprojection;
+                    vehicleIndex = 0;
+                    writeMask |= 0xFu << 12;
+                }
+                else if (opaqueDraw)
+                {
+                    // A static draw (or one with no earlier draw) in front of a vehicle's pixels: it writes the
+                    // "not written" value, as the target is cleared to, instead of leaving the vehicle's vector
+                    // showing through it. (A blended draw no car owns, a decal or glass, writes nothing.)
+                    vehicleIndex = 0;
+                    velocityMarker = true;
+                    writeMask |= 0xFu << 12;
+                }
+            }
+        }
         // Before the textures are looked up: a draw into scaled targets
         // samples scaled textures (every attachment shares the pitch, so the scale).
         s_drawScaled = false;
@@ -9530,7 +9856,9 @@ void main()
             return;
 
         // Pipeline state.
-        const TextureLayout& layout = GetTextureLayout(*s_vs, *s_ps);
+        // (The per-object blur pass also samples the vehicles' velocity: binding 31.)
+        const bool velocityViewDraw = VelocityWanted() && FindShaderOverride(s_ps->hash);
+        const TextureLayout& layout = GetTextureLayout(*s_vs, *s_ps, velocityViewDraw ? 1u << kVelocityTextureBinding : 0u);
         PipelineKey key{};
         key.vs = s_vs->hash;
         key.ps = s_ps->hash;
@@ -9549,6 +9877,8 @@ void main()
             if (bc != 0x00010001 && color[i]->blendable && !(adoptedColor & (1u << i)))
                 key.blend[i] = bc;
         }
+        if (color[3] && color[3] == s_velocityTarget.get())
+            key.blend[3] = ~0u;  // (no blending into the host-only target)
         key.colorMask = writeMask;  // (none for adopted targets)
         if (depth)
         {
@@ -9566,7 +9896,14 @@ void main()
             gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs);
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
-
+        // A pixel shader the renderer alters gets its own pipeline (PixelVariant).
+        key.pad = FindShaderOverride(s_ps->hash)
+            ? (s_motionBlurSetting == settings::kMotionBlurOff ? kPipelineVariantMotionBlurOff : 0u) |
+                (s_motionBlurSetting == settings::kMotionBlurPerObject ? kPipelineVariantPerObjectBlur : 0u)
+            : 0u;
+        if (vehicleIndex >= 0)
+            key.pad |= kPipelineVariantVehicleVelocity;
+        const bool velocityDraw = (key.pad & kPipelineVariantPerObjectBlur) != 0;
         bool pipelinePending;
         VkPipeline pipeline = GetPipeline(key, layout.pipeline, pipelinePending);
         if (pipelinePending)
@@ -9589,6 +9926,12 @@ void main()
                     continue;
                 VkDescriptorImageInfo& ii = textureInfos[d * 32 + n];
                 ii = { s_sampler, s_dummy[d].view, VK_IMAGE_LAYOUT_GENERAL };
+                if (d == 0 && n == kVelocityTextureBinding)
+                {
+                    if (s_velocityTarget)
+                        ii.imageView = s_velocityTarget->image.view;
+                    continue;
+                }
                 if (!(s_exp & 8))  // NFSMW_GPU_EXP bit 8: placeholders only (texture cost experiment)
                     ii.imageView = GetTexture(n, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube, ii.sampler);
             }
@@ -9753,7 +10096,7 @@ void main()
         {
             bool uploadConstants = g_constantsDirty.load(std::memory_order_relaxed) ||
                 s_lastConstantsSubmission != s_submissionCounter || !s_recording ||
-                constLayoutVs != s_lastConstLayoutVs || constLayoutPs != s_lastConstLayoutPs;
+                constLayoutVs != s_lastConstLayoutVs || constLayoutPs != s_lastConstLayoutPs || velocityDraw || vehicleIndex >= 0;
             VkDeviceSize need = (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) +
                 (copyCount ? 256 + copyBytes : 0);
             if (need == 0)
@@ -9781,12 +10124,26 @@ void main()
                 };
                 copyStage(constLayoutVs, 0);    // pc.vsConstBase
                 copyStage(constLayoutPs, 256);  // pc.psConstBase
+                if (velocityDraw && constLayoutPs)
+                {
+                    // The per-object blur's constants: slots the shader's packed constants leave free.
+                    float velocity[motionvectors::kSlots * 4];
+                    motionvectors::VelocityConstants(gpu::FrameCount(), velocity);
+                    memcpy(c + (256 + kVelocityConstants) * 16, velocity, sizeof(velocity));
+                }
                 s_lastConstLayoutVs = constLayoutVs;
                 s_lastConstLayoutPs = constLayoutPs;
                 memcpy(c + 512 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 48 * 16);
                 memcpy(c + 560 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 2 * 16);
                 memcpy(c + 562 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], 8 * 16);
-                memset(c + 570 * 16, 0, 4 * 16);
+                memset(c + kDrawInfoSlot * 16, 0, 8 * 16);
+                if (vehicleIndex >= 0)
+                    memcpy(c + kDrawInfoSlot * 16, vehicleReprojection.data(), sizeof(motionvectors::Matrix));
+                if (velocityMarker)
+                {
+                    const uint32_t one = 1;
+                    memcpy(c + (kDrawInfoSlot + 5) * 16, &one, sizeof(one));
+                }
                 s_lastConstantsOffset = at;
                 s_lastConstantsSubmission = s_submissionCounter;
                 s_stats.constantUploads++;
@@ -10876,6 +11233,19 @@ void main()
         {
             vkCmdSetDepthBias(s_cmd, bias[0], bias[1], bias[2]);
             memcpy(bound.bias, bias, sizeof(bias));
+        }
+
+        // A vehicle's draw: where a fragment is in guest clip space, from
+        // gl_FragCoord (the host viewport covers the whole target; the final
+        // posScale, after the ultrawide and bar adjustments above, is what
+        // the vertex shader used), for the velocity the pixel shader writes.
+        if (vehicleIndex >= 0)
+        {
+            float* map = reinterpret_cast<float*>(s_ringHost + constantsOffset + (kDrawInfoSlot + 4) * 16);
+            map[0] = 2.0f / (viewport.width * pc.posScale[0]);
+            map[1] = 2.0f / (viewport.height * pc.posScale[1]);
+            map[2] = (-1.0f - pc.posScale[2]) / pc.posScale[0];
+            map[3] = (-1.0f - pc.posScale[3]) / pc.posScale[1];
         }
 
         // Relative constant reads find the constants in g_ring, which every

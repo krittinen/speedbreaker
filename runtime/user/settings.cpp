@@ -183,6 +183,12 @@ namespace settings
             { 4, "2x", "2x (3200x3200)" },
         };
 
+        constexpr EnumEntry kMotionBlurEntries[] = {
+            { kMotionBlurOriginal, "original", "Original" },
+            { kMotionBlurOff, "off", "Off" },
+            { kMotionBlurPerObject, "per_object", "Per-object" },
+        };
+
         constexpr EnumEntry kAnisotropyEntries[] = {
             { kAnisotropyAuto, "auto", "Auto" },
             { 1, "off", "Off" },
@@ -355,6 +361,10 @@ namespace settings
               .table = "video", .key = "shadow_resolution", .label = "Shadow Resolution",
               .description = "Sharper sun shadows: draw the game's 1600x1600 shadow map at 1.5x or 2x. 1x is as on the Xbox 360. Higher settings use more GPU time and memory.",
               .env = "NFSMW_SHADOW_RESOLUTION", .defaultValue = kShadowResolutionDefault, .entries = kShadowResolutionEntries },
+            { .id = Id::MotionBlur, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Live,
+              .table = "video", .key = "motion_blur", .label = "Motion Blur",
+              .description = "The game's screen-wide blur while boosting and at speed. Off removes it and keeps the rest of the picture. Per-object (experimental) blurs along each object's own motion, the camera's and the vehicles', instead.",
+              .env = "NFSMW_MOTION_BLUR", .defaultValue = kMotionBlurOriginal, .entries = kMotionBlurEntries },
             { .id = Id::WindowWidth, .category = Category::Display, .type = Type::Int, .apply = Apply::Restart, .hidden = true,
               .table = "video", .key = "window_width", .label = "Window Width",
               .description = "The window's width when the game starts.",
