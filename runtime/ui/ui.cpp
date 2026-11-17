@@ -7,6 +7,8 @@
 #include <hid/wheel.h>       // the settings chord and the menus from a steering wheel
 #include <hid/wheel_map.h>   // ...which buttons those are
 #include <gpu/renderer.h>
+#include <gpu/motion_vectors.h>
+#include <gpu/command_processor.h>
 #include <kernel/xam.h>
 #include <report/report.h>
 #include <user/settings.h>
@@ -116,6 +118,7 @@ namespace ui
         }
 
         float s_appliedScale = 0.0f;
+
         uint32_t s_framebufferW = 0, s_framebufferH = 0;  // SetFramebufferSize
         bool s_displayFromSwapchain = false;  // the layout follows the swapchain, not the window (FitUiDisplay)
         ImGuiStyle s_baseStyle;
@@ -769,6 +772,29 @@ namespace ui
 #ifdef __APPLE__
             toggle |= e.key.key == SDLK_COMMA && (e.key.mod & SDL_KMOD_GUI);
 #endif
+            if (e.key.key == SDLK_F11 && !e.key.repeat && !s_modal)
+            {
+                // A marker for the log: "something looked wrong just now". The renderer's frame and the
+                // guest's picture count say which pictures to look at.
+                static uint32_t s_marks = 0;
+                s_marks++;
+                motionvectors::g_scanRequested.store(true);
+                fprintf(stderr, "[mark] #%u frame %llu guest pictures %llu\n", s_marks, (unsigned long long)gpu::FrameCount(),
+                    (unsigned long long)motionvectors::g_guestPictures.load(std::memory_order_relaxed));
+                Toast(std::format("Marker #{} logged", s_marks), 1.5);
+                return;
+            }
+            if (e.key.key == SDLK_F10 && !e.key.repeat && !s_modal)
+            {
+                const bool on = gpu::renderer::ToggleVehicleVectors();
+                Toast(on ? "Vehicle motion vectors: enabled" : "Vehicle motion vectors: disabled", 2.5);
+                return;
+            }
+            if (e.key.key == SDLK_F9 && !e.key.repeat && !s_modal)
+            {
+                gpu::renderer::ToggleVelocityView();
+                return;
+            }
             if (toggle && !e.key.repeat && !s_modal)
             {
                 ToggleSettings();

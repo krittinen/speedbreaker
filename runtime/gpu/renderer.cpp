@@ -12,6 +12,8 @@
 #include "covers.h"
 #include "edge_bars.h"
 #include "memory_plan.h"
+#include "motion_vectors.h"
+#include "command_processor.h"
 #include "pipeline_cache_header.h"
 #include "shader_translator.h"
 #include "zpd_report.h"
@@ -423,8 +425,12 @@ namespace gpu::renderer
         VkDeviceSize s_ringOffset = 0;
 
         // XenosConstants (shader_translator.cpp): c[512], fetch[48], bools[2],
-        // loops[8], drawInfo[4], each a vec4/uvec4.
-        constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 4) * 16;
+        // loops[8], drawInfo[8], each a vec4/uvec4. drawInfo is zero except for
+        // a vehicle's draw (the motion vectors): [0..3] the reprojection
+        // matrix, [4] the guest clip position of a fragment from
+        // gl_FragCoord (x scale, y scale, x offset, y offset), as floats.
+        constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 8) * 16;
+        constexpr uint32_t kDrawInfoSlot = 570;
 
         // Image memory. Images are bound at offsets into blocks of device
         // memory (64 MB; gpu/block_ranges.h keeps each block's free ranges),
@@ -1699,7 +1705,210 @@ namespace gpu::renderer
             { 0xd52a5eb6c17f9598ull, "motion blur", "vec4 vres = (xmul(r[1].xxxx, r[0].yyyy) + r[0].xxxx);", "vec4 vres = vec4(0.0);" },
         };
         constexpr uint32_t kPipelineVariantMotionBlurOff = 1;
+        constexpr uint32_t kPipelineVariantVelocityView = 2;
+        constexpr uint32_t kPipelineVariantPerObjectBlur = 8;  // the blur pass blurs along the motion vectors instead
+        constexpr uint32_t kPipelineVariantSplitView = 16;  // with the velocity view: only the right half shows it
+        constexpr uint32_t kPipelineVariantVehicleVelocity = 4;  // writes the vehicle's velocity to colour output 3
         int32_t s_motionBlurSetting = settings::kMotionBlurOriginal;
+        std::atomic<bool> s_velocityView{ false };  // F9: show the motion vectors in place of the picture
+        std::atomic<bool> s_velocitySplit{ false };  // F9 again: only the right half, the picture on the left
+        // F10: the vehicles' own vectors (written by their draws) join the camera's. On by default;
+        // NFSMW_MV_VEHICLES=0 starts with them off. Off: every pixel has the camera's motion (from the depth).
+        std::atomic<bool> s_vehicleVectors{ [] { const char* v = std::getenv("NFSMW_MV_VEHICLES"); return !v || v[0] != '0'; }() };
+        // The motion vectors are wanted: shown (F9) or blurred along (Motion Blur: Per-object).
+        inline bool VelocityWanted()
+        {
+            return s_velocityView.load(std::memory_order_relaxed) || s_motionBlurSetting == settings::kMotionBlurPerObject;
+        }
+        // The vehicles' own vectors are on (F10, or NFSMW_MV_VEHICLES=1 at launch), see s_vehicleVectors.
+        inline bool VehicleVectors()
+        {
+            return s_vehicleVectors.load(std::memory_order_relaxed);
+        }
+
+        // The velocity view, in place of the blur pass's colour output. The
+        // pass samples the scene's depth (t2d_4, the depth buffer's z/w) at
+        // its own texture coordinates (interpolator 0); the picture's
+        // reprojection matrix (gpu/motion_vectors.h) is in four constants
+        // past those the shader uses. sbVelocity is the one value the view
+        // draws, in texture coordinates (where the pixel was, minus where it
+        // is): objects' motion can later be combined into it. Shown as the
+        // Middlebury colour wheel: hue is the direction, saturation the
+        // length (full at kVelocityViewPixels), white no motion.
+        constexpr uint32_t kVelocityConstants = 64;  // pixel constant slot of the matrix' first row
+        constexpr std::string_view kVelocityViewFind = "vec4 vres = (xmul(r[0].wwww, r[1].xyzz) + r[0].xyzz);";
+        constexpr std::string_view kVelocityViewReplace = R"GLSL(vec4 vres = (xmul(r[0].wwww, r[1].xyzz) + r[0].xyzz);
+#ifdef IN0
+        {
+            vec2 sbUv = i_i0.xy;
+            float sbDepth = texture(t2d_4, sbUv).x;
+            float sbUsed = sbDepth > 0.0 ? sbDepth : 0.995;
+            vec2 sbNdc = vec2(sbUv.x * 2.0 - 1.0, 1.0 - sbUv.y * 2.0);
+            vec4 sbPrev = sbNdc.x * u.c[pc.psConstBase + 64u] + sbNdc.y * u.c[pc.psConstBase + 65u] +
+                sbUsed * u.c[pc.psConstBase + 66u] + u.c[pc.psConstBase + 67u];
+            vec2 sbVelocity = abs(sbPrev.w) > 1e-6 ? (sbPrev.xy / sbPrev.w - sbNdc) * vec2(0.5, -0.5) : vec2(0.0);
+            if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+            // The vehicles' own velocity (x = 1000 where none was drawn), written
+            // by their draws; the scene is the top 720 of the target's 1024 rows, the
+            // target's scale being the picture's own (not always 16:9 of its width).
+            ivec2 sbSize = textureSize(sbVelocityTex, 0);
+            ivec2 sbTexel = min(ivec2(sbUv * vec2(float(sbSize.x), float(sbSize.y) * 0.703125)), sbSize - 1);
+            vec4 sbObject = texelFetch(sbVelocityTex, sbTexel, 0);
+            if (sbObject.x < 100.0) sbVelocity = sbObject.xy;
+            if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+            vec2 sbPixels = sbVelocity * fetchSize2D(4u);
+            float sbHue = atan(sbPixels.y, sbPixels.x) * 0.15915494 + 0.5;
+            float sbSat = clamp(length(sbPixels) / 24.0, 0.0, 1.0);
+            vec3 sbRgb = clamp(abs(fract(vec3(sbHue) + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+            %SPLIT%vres.xyz = mix(vec3(1.0), sbRgb, sbSat);
+            %DIVIDER%
+        }
+#endif)GLSL";
+
+        constexpr std::string_view kVelocityTextureDeclaration =
+            "layout(set = 1, binding = 31) uniform sampler2D sbVelocityTex;\n";
+        constexpr uint32_t kVelocityTextureBinding = 31;  // (the guest's fetch slots end at 15)
+
+        // The per-object blur (Motion Blur: Per-object), in place of the blur pass's own. A
+        // pixel's motion is the vehicles' velocity where a vehicle's draw wrote it, else the
+        // camera's from its depth (as the velocity view shows); the strongest motion of a nearer
+        // object within a few pixels takes over (so a fast object's blur spreads over the edge of
+        // its silhouette); the picture is then sampled along that motion, as far as the shutter
+        // is open, the length capped, skipping what is in front of the pixel.
+        constexpr std::string_view kPerObjectBlurHelpers = R"GLSL(
+vec2 sbVelocityAt(vec2 sbUv, out float sbDepth)
+{
+    sbDepth = texture(t2d_4, sbUv).x;
+    // An empty depth copy (some pictures' copy is all zero) would give every pixel the near
+    // plane's motion; the far plane's (the camera's turn) is the better guess.
+    float sbUsed = sbDepth > 0.0 ? sbDepth : 0.995;
+    vec2 sbNdc = vec2(sbUv.x * 2.0 - 1.0, 1.0 - sbUv.y * 2.0);
+    vec4 sbPrev = sbNdc.x * u.c[pc.psConstBase + 64u] + sbNdc.y * u.c[pc.psConstBase + 65u] +
+        sbUsed * u.c[pc.psConstBase + 66u] + u.c[pc.psConstBase + 67u];
+    vec2 sbVelocity = abs(sbPrev.w) > 1e-6 ? (sbPrev.xy / sbPrev.w - sbNdc) * vec2(0.5, -0.5) : vec2(0.0);
+    if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+    ivec2 sbSize = textureSize(sbVelocityTex, 0);
+    ivec2 sbTexel = min(ivec2(sbUv * vec2(float(sbSize.x), float(sbSize.y) * 0.703125)), sbSize - 1);
+    vec4 sbObject = texelFetch(sbVelocityTex, sbTexel, 0);
+    if (sbObject.x < 100.0)
+    {
+        // An object's own motion below a few pixels (a chased car's bounce against the camera) is no
+        // blur; it ramps in over a few pixels more.
+        float sbPixels = length(sbObject.xy * fetchSize2D(4u));
+        sbVelocity = sbObject.xy * smoothstep(%KNEE0%, %KNEE1%, sbPixels);
+    }
+    if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+    return sbVelocity;
+}
+)GLSL";
+        constexpr std::string_view kPerObjectBlurFind = "vec4 vres = (xmul(r[5].xyzz, r[0].xxxx) + r[3].xyzz);";
+        // %SHUTTER% (the part of the picture's time the shutter is open) and %MAXPIXELS% (the
+        // longest blur, in pixels of the 1280x720 picture) are put in when the variant is built.
+        constexpr std::string_view kPerObjectBlurReplace = R"GLSL(vec4 vres = (xmul(r[5].xyzz, r[0].xxxx) + r[3].xyzz);
+#ifdef IN0
+        {
+            const float sbShutter = %SHUTTER%;
+            const float sbMaxPixels = %MAXPIXELS%;
+            vec2 sbUv = i_i0.xy;
+            vec2 sbPictureSize = fetchSize2D(4u);
+            float sbDepth0;
+            vec2 sbV = sbVelocityAt(sbUv, sbDepth0);
+            float sbReach = min(sbMaxPixels * 0.5, 14.0);
+            for (int sbI = 0; sbI < 8; sbI++)
+            {
+                float sbAngle = float(sbI) * 0.78539816;
+                float sbDepthN;
+                vec2 sbVn = sbVelocityAt(sbUv + vec2(cos(sbAngle), sin(sbAngle)) * sbReach / sbPictureSize, sbDepthN);
+                vec2 sbA = sbVn * sbPictureSize, sbB = sbV * sbPictureSize;
+                if ((1.0 - sbDepthN) > (1.0 - sbDepth0) * 1.08 && dot(sbA, sbA) > dot(sbB, sbB)) sbV = sbVn;
+            }
+            float sbLength = length(sbV * sbPictureSize);
+            if (sbLength > sbMaxPixels)
+            {
+                sbV *= sbMaxPixels / sbLength;
+                sbLength = sbMaxPixels;
+            }
+            vres.xyz = r[3].xyz;
+            if (sbLength >= 0.75)
+            {
+                sbV *= sbShutter;
+                int sbN = clamp(int(sbLength * sbShutter * 0.5) + 3, 4, 16);
+                float sbJitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5;
+                vec3 sbSum = vec3(0.0);
+                float sbWeight = 0.0;
+                for (int sbI = 0; sbI < 16; sbI++)
+                {
+                    if (sbI >= sbN) break;
+                    vec2 sbS = sbUv + sbV * ((float(sbI) + 0.5 + sbJitter) / float(sbN) - 0.5);
+                    float sbDepthS = texture(t2d_4, sbS).x;
+                    // A sample of something nearer (the car in front of the road) is left out, not
+                    // replaced by this pixel's colour: that kept a sharp band along the car's edge.
+                    if (sbDepth0 > 0.0 && sbDepthS > 0.0 && (1.0 - sbDepthS) > (1.0 - sbDepth0) * 1.08) continue;
+                    sbSum += texture(t2d_0, sbS, fetchLodBias(0u)).xyz;
+                    sbWeight += 1.0;
+                }
+                vres.xyz = sbWeight > 0.0 ? sbSum / sbWeight : r[3].xyz;
+            }
+        }
+#endif)GLSL";
+
+        std::string PerObjectBlurHelpers()
+        {
+            static const float knee = [] {
+                const char* v = std::getenv("NFSMW_MV_BLUR_KNEE");
+                return v ? std::clamp(float(std::atof(v)), 0.0f, 60.0f) : 6.0f;
+            }();
+            std::string s(kPerObjectBlurHelpers);
+            auto put = [&](const char* key, float value) {
+                const size_t pos = s.find(key);
+                if (pos != std::string::npos)
+                    s.replace(pos, std::strlen(key), std::format("{:.2f}", value));
+            };
+            put("%KNEE0%", knee);
+            put("%KNEE1%", knee * 2.3f + 0.01f);
+            return s;
+        }
+
+        std::string PerObjectBlurReplacement()
+        {
+            static const float shutter = [] {
+                const char* v = std::getenv("NFSMW_MV_BLUR_SHUTTER");
+                return v ? std::clamp(float(std::atof(v)), 0.05f, 2.0f) : 0.6f;
+            }();
+            static const float maxPixels = [] {
+                const char* v = std::getenv("NFSMW_MV_BLUR_MAX");
+                return v ? std::clamp(float(std::atof(v)), 2.0f, 200.0f) : 40.0f;
+            }();
+            std::string s(kPerObjectBlurReplace);
+            auto put = [&](const char* key, float value) {
+                const size_t pos = s.find(key);
+                if (pos != std::string::npos)
+                    s.replace(pos, std::strlen(key), std::format("{:.3f}", value));
+            };
+            put("%SHUTTER%", shutter);
+            put("%MAXPIXELS%", maxPixels);
+            return s;
+        }
+
+        // A vehicle's draw writes its own velocity to colour output 3, the
+        // host-only velocity target (kPipelineVariantVehicleVelocity): the
+        // fragment's guest NDC from gl_FragCoord (constants drawInfo[4]), its
+        // depth, and the draw's reprojection (drawInfo[0..3]), as the blur
+        // pass does for the camera.
+        constexpr std::string_view kVehicleVelocityFind = "o_c3 = o_color[3];";
+        constexpr std::string_view kVehicleVelocityReplace = R"GLSL({
+        if (u.drawInfo[5].x != 0u)
+            o_c3 = vec4(1000.0, 0.0, 0.0, 0.0);
+        else {
+        vec4 sbMap = uintBitsToFloat(u.drawInfo[4]);
+        vec2 sbNdc = gl_FragCoord.xy * sbMap.xy + sbMap.zw;
+        vec4 sbPrev = sbNdc.x * uintBitsToFloat(u.drawInfo[0]) + sbNdc.y * uintBitsToFloat(u.drawInfo[1]) +
+            gl_FragCoord.z * uintBitsToFloat(u.drawInfo[2]) + uintBitsToFloat(u.drawInfo[3]);
+        vec2 sbVelocity = abs(sbPrev.w) > 1e-6 ? (sbPrev.xy / sbPrev.w - sbNdc) * vec2(0.5, -0.5) : vec2(0.0);
+        if (any(isnan(sbVelocity)) || any(isinf(sbVelocity))) sbVelocity = vec2(0.0);
+        o_c3 = vec4(sbVelocity, 0.0, 0.0);
+        }
+    })GLSL";
 
         const ShaderOverride* FindShaderOverride(uint64_t hash)
         {
@@ -1711,18 +1920,64 @@ namespace gpu::renderer
 
         std::string PatchedPixelShaderGlsl(const Shader& ps, uint32_t variant)
         {
-            const ShaderOverride* o = (variant & kPipelineVariantMotionBlurOff) ? FindShaderOverride(ps.hash) : nullptr;
-            if (!o)
+            // NFSMW_DUMP_GLSL=<hex hash>: the translated GLSL of that pixel shader, to ps_<hash>.glsl in the working directory.
+            static const char* dumpGlsl = std::getenv("NFSMW_DUMP_GLSL");
+            static bool dumped = false;
+            if (dumpGlsl && !dumped && ps.hash == std::strtoull(dumpGlsl, nullptr, 16))
+            {
+                dumped = true;
+                char path[64];
+                snprintf(path, sizeof(path), "ps_%016llx.glsl", (unsigned long long)ps.hash);
+                if (FILE* f = fopen(path, "wb"))
+                {
+                    fwrite(ps.info.glsl.data(), 1, ps.info.glsl.size(), f);
+                    fclose(f);
+                    fprintf(stderr, "[renderer] wrote %s (%zu bytes)\n", path, ps.info.glsl.size());
+                }
+            }
+            const ShaderOverride* o = (variant & (kPipelineVariantMotionBlurOff | kPipelineVariantVelocityView | kPipelineVariantPerObjectBlur)) ? FindShaderOverride(ps.hash) : nullptr;
+            if (!o && !(variant & kPipelineVariantVehicleVelocity))
                 return ps.info.glsl;
             std::string glsl = ps.info.glsl;
-            const size_t pos = glsl.find(o->find);
-            if (pos == std::string::npos)
+            auto patch = [&](std::string_view find, std::string_view replace) {
+                const size_t pos = glsl.find(find);
+                if (pos == std::string::npos)
+                    fprintf(stderr, "[renderer] ps_%016llx: expected statement not found for a variant, left as is: %.*s\n",
+                        (unsigned long long)ps.hash, int(find.size()), find.data());
+                else
+                    glsl.replace(pos, find.size(), replace);
+            };
+            if (o && (variant & kPipelineVariantMotionBlurOff))
+                patch(o->find, o->replaceOff);
+            if (o && (variant & (kPipelineVariantVelocityView | kPipelineVariantPerObjectBlur)))
             {
-                fprintf(stderr, "[renderer] %.*s: expected statement not found in ps_%016llx, left as is\n", int(o->name.size()), o->name.data(),
-                    (unsigned long long)ps.hash);
-                return glsl;
+                const size_t main = glsl.rfind("void main()");
+                if (main != std::string::npos)
+                    glsl.insert(main, kVelocityTextureDeclaration);
             }
-            glsl.replace(pos, o->find.size(), o->replaceOff);
+            if (o && (variant & kPipelineVariantVelocityView))
+            {
+                // Split (F9 a second time): the vectors only in the right half, a thin black line between.
+                std::string view(kVelocityViewReplace);
+                auto put = [&](const char* key, const char* value) {
+                    const size_t pos = view.find(key);
+                    if (pos != std::string::npos)
+                        view.replace(pos, std::strlen(key), value);
+                };
+                const bool split = (variant & kPipelineVariantSplitView) != 0;
+                put("%SPLIT%", split ? "if (sbUv.x >= 0.5) " : "");
+                put("%DIVIDER%", split ? "if (abs(sbUv.x - 0.5) < 0.0006) vres.xyz = vec3(0.0);" : "");
+                patch(kVelocityViewFind, view);
+            }
+            if (o && (variant & kPipelineVariantPerObjectBlur))
+            {
+                const size_t main = glsl.rfind("void main()");
+                if (main != std::string::npos)
+                    glsl.insert(main, PerObjectBlurHelpers());
+                patch(kPerObjectBlurFind, PerObjectBlurReplacement());
+            }
+            if (variant & kPipelineVariantVehicleVelocity)
+                patch(kVehicleVelocityFind, kVehicleVelocityReplace);
             return glsl;
         }
 
@@ -2050,7 +2305,7 @@ namespace gpu::renderer
 
         VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, uint32_t variant)
         {
-            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | ((variant & 0xF) << 21);
+            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | ((variant & 0x1F) << 21);
             std::lock_guard lock(ps.compileMutex);
             auto it = ps.variants.find(key);
             if (it != ps.variants.end())
@@ -2125,24 +2380,27 @@ namespace gpu::renderer
         };
         std::map<std::array<uint32_t, 6>, std::unique_ptr<TextureLayout>> s_textureLayouts;
 
-        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps);
+        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps, uint32_t extraPs2D);
 
-        const TextureLayout& GetTextureLayout(const Shader& vs, const Shader& ps)
+        // `extraPs2D`: 2D texture bindings the renderer adds to the pixel stage (a variant's).
+        const TextureLayout& GetTextureLayout(const Shader& vs, const Shader& ps, uint32_t extraPs2D = 0)
         {
             static const Shader *lastVs = nullptr, *lastPs = nullptr;
+            static uint32_t lastExtra = 0;
             static const TextureLayout* last = nullptr;
-            if (&vs == lastVs && &ps == lastPs)
+            if (&vs == lastVs && &ps == lastPs && extraPs2D == lastExtra)
                 return *last;
             lastVs = &vs;
             lastPs = &ps;
-            last = &GetTextureLayoutUncached(vs, ps);
+            lastExtra = extraPs2D;
+            last = &GetTextureLayoutUncached(vs, ps, extraPs2D);
             return *last;
         }
 
-        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps)
+        const TextureLayout& GetTextureLayoutUncached(const Shader& vs, const Shader& ps, uint32_t extraPs2D)
         {
             std::array<uint32_t, 3> v = { vs.info.texture2DMask, vs.info.texture3DMask, vs.info.textureCubeMask };
-            std::array<uint32_t, 3> p = { ps.info.texture2DMask, ps.info.texture3DMask, ps.info.textureCubeMask };
+            std::array<uint32_t, 3> p = { ps.info.texture2DMask | extraPs2D, ps.info.texture3DMask, ps.info.textureCubeMask };
             std::array<uint32_t, 6> key = { v[0], v[1], v[2], p[0], p[1], p[2] };
             auto& slot = s_textureLayouts[key];
             if (slot)
@@ -2542,12 +2800,15 @@ namespace gpu::renderer
 #endif
         // A new target, at the current scale if its pitch is a scaled one,
         // cleared to zero (new EDRAM contents).
-        std::unique_ptr<RenderTarget> CreateTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, bool wide)
+        std::unique_ptr<RenderTarget> CreateTarget(uint32_t base, uint32_t format, bool depth, uint32_t pitch, bool wide,
+            VkFormat forceFormat = VK_FORMAT_UNDEFINED, uint32_t forceRows = 0)
         {
             // Height: whatever fits in EDRAM (2048 tiles of 80x16 32-bit
             // samples) from this base, capped at the 2048-line maximum.
             uint32_t tilesPerRow = std::max(1u, (pitch + 79) / 80) * (!depth && Is64bpp(format) ? 2 : 1);
             uint32_t rows = std::clamp((2048u - std::min(base, 2047u)) / tilesPerRow * 16, 16u, 2048u);
+            if (forceRows)
+                rows = forceRows;
 
             auto rt = std::make_unique<RenderTarget>();
             rt->base = base;
@@ -2565,7 +2826,7 @@ namespace gpu::renderer
             // has room for its last host column.)
             rt->width = rt->scale.x.Size(rt->guestWidth);
             rt->height = rt->scale.y.Size(rt->guestHeight);
-            rt->vkFormat = depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : ColorFormat(format);
+            rt->vkFormat = forceFormat != VK_FORMAT_UNDEFINED ? forceFormat : depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : ColorFormat(format);
             VkFormatProperties fp;
             vkGetPhysicalDeviceFormatProperties(s_vk->physical, rt->vkFormat, &fp);
             rt->blendable = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
@@ -5902,6 +6163,41 @@ void main()
             s_pendingClears.push_back({ rt, rect, ca.clearValue });
         }
 
+        // The vehicles' velocity (the motion vectors of objects, see
+        // kPipelineVariantVehicleVelocity): a host-only target the size of the
+        // scene's (1024 rows: its depth target's), attached as colour 3 of
+        // every draw into the scene, and cleared to "no object" (x = 1000)
+        // by the first of each picture. RG16F: the velocity in texture
+        // coordinates, where a vehicle was drawn.
+        std::unique_ptr<RenderTarget> s_velocityTarget;
+        uint64_t s_velocityClearedPicture = ~0ull;
+        uint32_t s_velocityClears = 0, s_velocityDrawsSinceClear = 0, s_velocityDrawsAtBlur = 0;
+
+        RenderTarget* SceneVelocityTarget(bool wide)
+        {
+            if (!s_velocityTarget)
+            {
+                s_velocityTarget = CreateTarget(0, 0, false, 1280, wide, VK_FORMAT_R16G16_SFLOAT, 1024);
+                s_velocityClearedPicture = ~0ull;
+            }
+            RenderTarget* rt = s_velocityTarget.get();
+            const uint64_t picture = gpu::FrameCount();
+            if (s_velocityClearedPicture != picture)
+            {
+                s_velocityClearedPicture = picture;
+                s_velocityClears++;
+                s_velocityDrawsSinceClear = 0;
+                EndPass();
+                Begin();
+                VkClearColorValue none{};
+                none.float32[0] = 1000.0f;
+                VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(s_cmd, rt->image.image, VK_IMAGE_LAYOUT_GENERAL, &none, 1, &range);
+                FullBarrier();
+            }
+            return rt;
+        }
+
         // NFSMW_LOG_SHADOWMAP=1 (diagnostic): every 5 s, the first depth
         // resolve from a surface of pitch 1600 (the sun's shadow map) is
         // copied back after it, and a [shadowmap] line gives the share of its
@@ -8624,6 +8920,12 @@ void main()
             const gpu::RenderScale old = s_renderScale;
             Flush();
             s_renderScale = scale;
+            if (s_velocityTarget)
+            {
+                std::erase_if(s_pendingClears, [&](const PendingClear& pc) { return pc.rt == s_velocityTarget.get(); });
+                DestroyTarget(*s_velocityTarget);
+                s_velocityTarget.reset();
+            }
             s_shadowTargetsByResolve.clear();
             PrewarmResolvePipelines(scale);
             if (scale != s_shadowScale)
@@ -9495,6 +9797,321 @@ void main()
                     adoptedDepth ? (adoptedColor ? "colour and depth" : "depth") : "colour");
             }
         }
+        // The vehicles' velocity (while the velocity view is on): every draw
+        // into the scene's targets also attaches the velocity target as
+        // colour 3 (a pass restarts when its attachments change), writing
+        // it only for a vehicle's own draws. A vehicle's draw is found by its
+        // vertex shader's c0-c3 being the vehicle's world * view-projection
+        // (as columns), and must write depth: the translucent shadow blob
+        // under it, drawn with the same matrices, would otherwise give the
+        // road beneath the vehicle its motion.
+        int vehicleIndex = -1;
+        bool velocityMarker = false;  // a draw that is not a vehicle's covers its pixels with "not written"
+        motionvectors::Matrix vehicleReprojection = motionvectors::Identity();
+        // The scene's depth surface is at EDRAM tile 1024 in most pictures; at 30 fps the game also draws it at 1312 and 1328
+        // (the same 1280-wide colour surface at tile 0), and, with 2x multisampling (low speeds at 30 fps), in two 640-wide tiles
+        // from tile 1312, which the renderer draws side by side; the vehicle vectors stopped in those pictures.
+        const bool sceneSurfaces = depth &&
+            (((depth->base == 1024 || depth->base == 1312 || depth->base == 1328) && depth->pitch == 1280) ||
+                (depth->base == 1312 && depth->pitch == 640 && surface.msaa_samples != xenos::MsaaSamples::k1X)) &&
+            (!color[0] || (!color[0]->depth && color[0]->base == 0 && color[0]->pitch == depth->pitch));
+        // NFSMW_LOG_MV: a line for each picture where no draw reached the vehicle path, with the draws' targets by count.
+        if (VelocityWanted() && std::getenv("NFSMW_LOG_MV"))
+        {
+            static uint64_t s_tallyFrame = ~0ull;
+            static std::map<std::string, uint32_t> s_tally;
+            static bool s_tallyAccepted = false;
+            static uint32_t s_tallyLines = 0;
+            const uint64_t tf = gpu::FrameCount();
+            if (tf != s_tallyFrame)
+            {
+                if (s_tallyFrame != ~0ull && !s_tallyAccepted && s_tallyLines < 120 && !s_tally.empty())
+                {
+                    std::string text;
+                    int shown = 0;
+                    for (const auto& kv : s_tally)
+                        if (shown++ < 40)
+                            text += std::format(" | {} x{}", kv.first, kv.second);
+                    static std::string s_lastText;
+                    if (text != s_lastText)
+                    {
+                        s_lastText = text;
+                        s_tallyLines++;
+                        fprintf(stderr, "[mvs] frame %llu: no draw reached the vehicle path:%s\n", (unsigned long long)s_tallyFrame, text.c_str());
+                    }
+                }
+                s_tally.clear();
+                s_tallyAccepted = false;
+                s_tallyFrame = tf;
+            }
+            if (sceneSurfaces && (!color[3] || color[3] == s_velocityTarget.get()) && (writeMask >> 12) == 0)
+                s_tallyAccepted = true;
+            else
+                s_tally[std::format("depth {} b{} p{} c0 {} b{} p{}{} c3 {}{} wm {:X} msaa {}", depth ? "yes" : "NO", depth ? depth->base : 0, depth ? depth->pitch : 0,
+                    color[0] ? "yes" : "no", color[0] ? color[0]->base : 0, color[0] ? color[0]->pitch : 0, color[0] && color[0]->depth ? " DEPTHSURF" : "",
+                    color[3] ? "yes" : "no", color[3] && color[3] != s_velocityTarget.get() ? " OWN" : "", writeMask, int(surface.msaa_samples))]++;
+        }
+        // (see the surfaces above)
+        if (VelocityWanted() && sceneSurfaces && (!color[3] || color[3] == s_velocityTarget.get()) && (writeMask >> 12) == 0)
+        {
+            color[3] = SceneVelocityTarget(depth->wide);
+            const bool opaqueDraw = depthControl.z_write_enable && (s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF) == 0x00010001;
+            if (VehicleVectors() && (writeMask & 0xF) && color[0] && !(adoptedColor & 1) && (s_vs->info.constUsed[0] & 0xF) == 0xF)
+            {
+                motionvectors::Matrix drawClip;
+                for (uint32_t r = 0; r < 4; r++)
+                    for (uint32_t k = 0; k < 4; k++)
+                        memcpy(&drawClip[k * 4 + r], &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + r * 4 + k], 4);
+                uint64_t mesh = (s_vs->hash * 0x9E3779B97F4A7C15ull) ^ (uint64_t(count) << 32) ^ (dmaBase & 0x1FFFFFFF);
+                motionvectors::g_drawBufferCount = 0;
+                motionvectors::g_drawBuffers[motionvectors::g_drawBufferCount++] = uint32_t(dmaBase & 0x1FFFFFFC);
+                for (uint32_t word = 0; word < 3; word++)
+                    for (uint32_t bits = s_vs->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
+                    {
+                        const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (word * 32 + uint32_t(__builtin_ctz(bits))) * 2];
+                        if (motionvectors::g_drawBufferCount < 10)
+                            motionvectors::g_drawBuffers[motionvectors::g_drawBufferCount++] = vf[0] & 0x1FFFFFFC;
+                        mesh = (mesh ^ (vf[0] & 0x1FFFFFFC)) * 0x100000001B3ull;
+                    }
+                motionvectors::Matrix reprojection;
+                // Only a vehicle part's vertex shader can give a draw a vehicle's vector. The wheel
+                // shaders (4ad5b44a, abfb2daf, 580d1cb7) also draw trees and props far from any car, but a
+                // draw only gets a vector when a listed car owns it (the generic matcher is off), so they
+                // are safe here. Any other draw is not followed and writes "not written", covering what is
+                // behind it. NFSMW_MV_VEHICLE_VS=<hex>[,<hex>...] adds vertex shaders (the first 8 digits as logged).
+                static const std::vector<uint32_t> vehicleShaders = [] {
+                    std::vector<uint32_t> v = { 0xf3cb08fa, 0x31a7fc62, 0x50eb5376, 0x580d1cb7, 0x4ad5b44a, 0xabfb2daf, 0x9fd9f10d };
+                    if (const char* extra = std::getenv("NFSMW_MV_VEHICLE_VS"))
+                        for (const char* p = extra; *p;)
+                        {
+                            char* end = nullptr;
+                            const unsigned long long x = std::strtoull(p, &end, 16);
+                            if (end == p)
+                                break;
+                            v.push_back(uint32_t(x));
+                            p = *end == ',' ? end + 1 : end;
+                        }
+                    return v;
+                }();
+                const uint32_t vertexShaderId = uint32_t(s_vs->hash >> 32);
+                if (!motionvectors::g_matrixCandidates.empty() || motionvectors::g_matchPending.load())
+                    motionvectors::MatchCandidates(gpu::FrameCount(), drawClip, vertexShaderId, count);
+                const bool ownedByACar = motionvectors::OwnershipGate() && motionvectors::AnyCarOwnsDraw(gpu::FrameCount());
+                const bool vehiclePart = ownedByACar || std::find(vehicleShaders.begin(), vehicleShaders.end(), vertexShaderId) != vehicleShaders.end();
+                motionvectors::g_strictOwnership = vertexShaderId == 0x580d1cb7 || vertexShaderId == 0x4ad5b44a || vertexShaderId == 0xabfb2daf;
+                const auto noteStart = std::chrono::steady_clock::now();
+                const motionvectors::DrawMotion motion = !vehiclePart ? motionvectors::DrawMotion::Static : motionvectors::NoteDraw(gpu::FrameCount(), mesh,
+                    (s_vs->hash * 0x9E3779B97F4A7C15ull) ^ (s_ps->hash << 1) ^ (uint64_t(count) << 32), drawClip, reprojection);
+                static uint64_t s_noteNs = 0, s_noteDraws = 0;
+                if (std::getenv("NFSMW_LOG_DECLINED") && motion != motionvectors::DrawMotion::Moving && (gpu::FrameCount() % 4) == 0)
+                {
+                    // Draws near a listed car that got no vector: of a vehicle shader the local path declined, or of a shader off the list.
+                    static uint32_t s_declinedLines = 0;
+                    const float nearCar = vehiclePart && motionvectors::g_declineKind ? motionvectors::g_declineDistance : motionvectors::NearestListedCar(gpu::FrameCount(), drawClip);
+                    const bool bodyShader = vertexShaderId == 0xf3cb08fa || vertexShaderId == 0x31a7fc62;
+                    if (s_declinedLines < 60000 && (nearCar < 4.0f || (bodyShader && motion != motionvectors::DrawMotion::Moving)) && (!vehiclePart || motionvectors::g_declineKind || !ownedByACar))
+                    {
+                        s_declinedLines++;
+                        fprintf(stderr, "[mvd] %llu vs%08x ps%08llx i%u %s kind %d dist %.2f box %.2f dL %.3f blend %d scale %.3f\n", (unsigned long long)gpu::FrameCount(),
+                            vertexShaderId, (unsigned long long)(s_ps->hash >> 32), count, ownedByACar ? "listed" : "UNOWNED",
+                            vehiclePart ? motionvectors::g_declineKind : -1, nearCar, vehiclePart ? motionvectors::g_declineBox : 0.0f,
+                            vehiclePart ? motionvectors::g_declineL : 0.0f, opaqueDraw ? 0 : 1, motionvectors::g_declineScale);
+                    }
+                }
+                s_noteNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - noteStart).count());
+                s_noteDraws++;
+                static const bool logMotion = std::getenv("NFSMW_LOG_MV") != nullptr;
+                static uint64_t s_logFrame = ~0ull;
+                static uint32_t s_counts[4] = {}, s_dev[5] = {}, s_offsets[6] = {}, s_reasons[4] = {};
+                static uint32_t s_lines = 0;
+                if (logMotion)
+                {
+                    const uint64_t f = gpu::FrameCount();
+                    if (f != s_logFrame)
+                    {
+                        // One compact line a picture for the whole run: the cars the game lists, the draws by outcome, the
+                        // parts that found their earlier draw and those that fell back to rigid, the vehicle path's own
+                        // time (all vehicle-shader draws) and the whole picture's draws' share of that.
+                        static uint32_t s_frameLines = 0;
+                        static uint64_t s_lastMatched = 0, s_lastRigid = 0, s_lastNs = 0, s_lastDraws = 0;
+                        if (s_logFrame != ~0ull && s_frameLines++ < 60000)
+                        {
+                            motionvectors::Entry listed;
+                            const size_t carsListed = motionvectors::LookupEntry(s_logFrame, listed) ? listed.vehicles.size() : 0;
+                            fprintf(stderr, "[mvf] %llu cars %zu notclip %u norev %u static %u moving %u matched %llu rigid %llu path %.2f ms over %llu draws\n",
+                                (unsigned long long)s_logFrame, carsListed, s_counts[0], s_counts[1], s_counts[2], s_counts[3],
+                                (unsigned long long)(motionvectors::g_localHits - s_lastMatched), (unsigned long long)(motionvectors::g_localRigid - s_lastRigid),
+                                double(s_noteNs - s_lastNs) / 1e6, (unsigned long long)(s_noteDraws - s_lastDraws));
+                            s_lastMatched = motionvectors::g_localHits;
+                            s_lastRigid = motionvectors::g_localRigid;
+                            s_lastNs = s_noteNs;
+                            s_lastDraws = s_noteDraws;
+                        }
+                        if (s_logFrame != ~0ull && s_counts[3] && s_lines++ < 4000)
+                            fprintf(stderr, "[mv] frame %llu: draws not clip %u, no previous %u, static %u, moving %u\n",
+                                (unsigned long long)s_logFrame, s_counts[0], s_counts[1], s_counts[2], s_counts[3]);
+                        if (s_logFrame != ~0ull && s_counts[3] && s_lines < 4000)
+                        {
+                            motionvectors::PictureMatrices pm;
+                            float step = -1.0f;
+                            if (motionvectors::LookupPicture(s_logFrame, pm))
+                            {
+                                const auto& m = pm.reprojection;
+                                const float pw = 0.99f * m[11] + m[15];
+                                step = std::hypot((0.99f * m[8] + m[12]) / pw, (0.99f * m[9] + m[13]) / pw);
+                            }
+                            fprintf(stderr, "[mv] frame %llu: moving by deviation <.002 %u <.005 %u <.01 %u <.03 %u more %u; picture offsets 0,-1,1,-2,2,3: %u %u %u %u %u %u; camera step %.5f\n",
+                                (unsigned long long)s_logFrame, s_dev[0], s_dev[1], s_dev[2], s_dev[3], s_dev[4], s_offsets[0], s_offsets[1],
+                                s_offsets[2], s_offsets[3], s_offsets[4], s_offsets[5], step);
+                            fprintf(stderr, "[mv] frame %llu: no previous because cut/missing %u, mesh new %u, none from the picture before %u, too far %u; vehicle-list hits %llu, local matched %llu rigid %llu, local declined near-car %llu cut %llu inverse %llu no-pose %llu\n",
+                                (unsigned long long)s_logFrame, s_reasons[0], s_reasons[1], s_reasons[2], s_reasons[3], (unsigned long long)motionvectors::g_vehicleHits,
+                                (unsigned long long)motionvectors::g_localHits, (unsigned long long)motionvectors::g_localRigid,
+                                (unsigned long long)motionvectors::g_localMiss[0], (unsigned long long)motionvectors::g_localMiss[1],
+                                (unsigned long long)motionvectors::g_localMiss[2], (unsigned long long)motionvectors::g_localMiss[3]);
+                        }
+                        memset(s_counts, 0, sizeof(s_counts));
+                        memset(s_dev, 0, sizeof(s_dev));
+                        memset(s_offsets, 0, sizeof(s_offsets));
+                        memset(s_reasons, 0, sizeof(s_reasons));
+                        s_logFrame = f;
+                    }
+                    s_counts[int(motion)]++;
+                    if ((motion == motionvectors::DrawMotion::NoPrevious && (f % 20) < 4) || (motion == motionvectors::DrawMotion::Moving && (f % 50) == 0))
+                                        {
+                                            static uint32_t s_drawLines = 0;
+                                            if (s_drawLines++ < 30000)
+                                                fprintf(stderr, "[mv] draw %llu %c vs%08llx ps%08llx i%u w %.0f %.0f %.0f n%.1f vp %.0f %.0f %.0f %.0f\n",
+                                                    (unsigned long long)f, motion == motionvectors::DrawMotion::Moving ? 'M' : 'N',
+                                                    (unsigned long long)(s_vs->hash >> 32), (unsigned long long)(s_ps->hash >> 32), count, motionvectors::g_lastWorld[0],
+                                                    motionvectors::g_lastWorld[1], motionvectors::g_lastWorld[2], motionvectors::g_lastNearest,
+                                                    RegF(XE_GPU_REG_PA_CL_VPORT_XOFFSET), RegF(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+                                                    std::fabs(RegF(XE_GPU_REG_PA_CL_VPORT_XSCALE)), std::fabs(RegF(XE_GPU_REG_PA_CL_VPORT_YSCALE)));
+                                        }
+                    if (motion == motionvectors::DrawMotion::Moving && (f % 20) < 4)
+                    {
+                        static uint32_t s_wheelLines = 0, s_bodySkip = 0;
+                        // The body's many parts agree with each other; log one in six of them, every other part.
+                        const uint64_t shader = s_vs->hash >> 32;
+                        if ((shader != 0xf3cb08fa && shader != 0x48553c3b || (s_bodySkip++ % 6) == 0) && s_wheelLines++ < 250000)
+                            fprintf(stderr, "[mvw] %llu src%d car%08x move %.3f %.3f %.3f vs%08llx i%u w %.1f %.1f %.1f local %.2f %.2f %.2f hub%d reach %.4f %.4f vp %.0f %.0f %.0f %.0f metres %.2f %.2f %.2f dist %.2f\n",
+                                (unsigned long long)f, motionvectors::g_lastSource, motionvectors::g_lastCarId, motionvectors::g_lastMove[0],
+                                motionvectors::g_lastMove[1], motionvectors::g_lastMove[2], (unsigned long long)(s_vs->hash >> 32), count,
+                                motionvectors::g_lastWorld[0], motionvectors::g_lastWorld[1], motionvectors::g_lastWorld[2],
+                                motionvectors::g_lastLocal[0], motionvectors::g_lastLocal[1], motionvectors::g_lastLocal[2], motionvectors::g_lastHub ? 1 : 0,
+                                motionvectors::g_lastReach[0], motionvectors::g_lastReach[1],
+                                RegF(XE_GPU_REG_PA_CL_VPORT_XOFFSET), RegF(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+                                std::fabs(RegF(XE_GPU_REG_PA_CL_VPORT_XSCALE)), std::fabs(RegF(XE_GPU_REG_PA_CL_VPORT_YSCALE)),
+                                motionvectors::g_lastMetres[0], motionvectors::g_lastMetres[1], motionvectors::g_lastMetres[2], motionvectors::g_lastDistance);
+                                                    }
+                                                    if (motion == motionvectors::DrawMotion::Moving && (f % 20) < 4 && std::getenv("NFSMW_LOG_CAR_MODELS"))
+                    {
+                        // The vertex buffers (guest physical addresses and sizes) of a car-owned draw, to be matched
+                        // against the addresses found in the car's models ([carmodel] lines).
+                        static uint32_t s_bufferLines = 0;
+                        if (s_bufferLines++ < 60000)
+                        {
+                            std::string buffers;
+                            for (uint32_t word = 0; word < 3; word++)
+                                for (uint32_t bits = s_vs->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
+                                {
+                                    const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (word * 32 + uint32_t(__builtin_ctz(bits))) * 2];
+                                    buffers += std::format(" {:08X}:{:X}", vf[0] & 0x1FFFFFFC, vf[1]);
+                                }
+                            fprintf(stderr, "[mvv] %llu car%08x vs%08llx i%u dma %08X buffers%s\n", (unsigned long long)f, motionvectors::g_lastCarId,
+                                (unsigned long long)(s_vs->hash >> 32), count, uint32_t(dmaBase & 0x1FFFFFFF), buffers.c_str());
+                        }
+                    }
+                    if (motion == motionvectors::DrawMotion::NoPrevious)
+                        s_reasons[motionvectors::g_lastReason]++;
+                    if (motion == motionvectors::DrawMotion::Moving)
+                    {
+                        const float dv = motionvectors::g_lastDeviation;
+                        s_dev[dv < 0.002f ? 0 : dv < 0.005f ? 1 : dv < 0.01f ? 2 : dv < 0.03f ? 3 : 4]++;
+                        const int o = motionvectors::g_lastOffset;
+                        s_offsets[o == 0 ? 0 : o == -1 ? 1 : o == 1 ? 2 : o == -2 ? 3 : o == 2 ? 4 : 5]++;
+                    }
+                }
+                if (motion == motionvectors::DrawMotion::Moving)
+                {
+                    vehicleReprojection = reprojection;
+                    s_velocityDrawsSinceClear++;
+                    vehicleIndex = 0;
+                    writeMask |= 0xFu << 12;
+                }
+                else if (!opaqueDraw)
+                {
+                    // A blended or non-depth-writing draw (a decal, glass, the shadow's blob) that no car
+                    // owns writes nothing: it must not cover a vehicle's vector under it.
+                }
+                else if (motion == motionvectors::DrawMotion::Static && std::getenv("NFSMW_MV_STATIC_WRITE"))
+                {
+                    // The camera's own vector under the draw's own picture, so a distant tree's false
+                    // vector left underneath is covered; nothing else is touched.
+                    motionvectors::PictureMatrices pm;
+                    if (motionvectors::LookupPicture(gpu::FrameCount() + motionvectors::g_lastOffset, pm) && !pm.cut)
+                    {
+                        vehicleReprojection = pm.reprojection;
+                        vehicleIndex = 0;
+                        writeMask |= 0xFu << 12;
+                    }
+                }
+                else if (!std::getenv("NFSMW_MV_NO_MARKER"))
+                {
+                    // A static draw (or one with no earlier draw) in front of a vehicle's pixels:
+                    // it writes the "not written" value, as the target is cleared to, instead of
+                    // leaving the vehicle's vector showing through it.
+                    vehicleIndex = 0;
+                    velocityMarker = true;
+                    writeMask |= 0xFu << 12;
+                }
+            }
+            else
+            {
+                if (std::getenv("NFSMW_LOG_MV"))
+                    LogOnce(0x3300 ^ ((writeMask & 0xF) * 131 + (color[0] ? 7 : 0) + ((adoptedColor & 1) ? 13 : 0) + (s_vs->info.constUsed[0] & 0xF) * 977 + depth->base * 31 + (VehicleVectors() ? 5 : 0)),
+                        "[mv] scene draws the vehicle path skipped: vehicle vectors %d, writeMask %X, colour0 %s, adopted %d, vs constants used %X, depth base %u",
+                        VehicleVectors() ? 1 : 0, writeMask & 0xF, color[0] ? "yes" : "no", int(adoptedColor & 1), s_vs->info.constUsed[0] & 0xF, depth->base);
+                // take (no depth write, blended, or no colour) and that sit at a listed car: the
+                // car's lights, plate, glass and the like.
+                static const bool logLights = std::getenv("NFSMW_LOG_LIGHTS") != nullptr;
+                static uint32_t s_lightLines = 0;
+                const uint64_t lf = gpu::FrameCount();
+                if (logLights && (lf % 20) < 4 && s_lightLines < 20000 && (s_vs->info.constUsed[0] & 0xF) == 0xF)
+                {
+                    motionvectors::Matrix clip;
+                    for (uint32_t r = 0; r < 4; r++)
+                        for (uint32_t k = 0; k < 4; k++)
+                            memcpy(&clip[k * 4 + r], &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + r * 4 + k], 4);
+                    motionvectors::PictureMatrices pm;
+                    motionvectors::Entry e;
+                    if (motionvectors::LookupPicture(lf, pm) && motionvectors::LookupEntry(lf, e))
+                    {
+                        const motionvectors::Matrix w = motionvectors::Multiply(clip, pm.inverseViewProjection);
+                        float nearest = 1e9f;
+                        for (const motionvectors::Vehicle& v : e.vehicles)
+                            nearest = std::min(nearest, std::hypot(w[12] - v.world[12], w[13] - v.world[13], w[14] - v.world[14]));
+                        if (nearest < 4.0f)
+                        {
+                            s_lightLines++;
+                            fprintf(stderr, "[mvz] %llu vs%08llx ps%08llx i%u zwrite %d blend %08X colour0 %d writeMask %X d%.1f\n", (unsigned long long)lf,
+                                (unsigned long long)(s_vs->hash >> 32), (unsigned long long)(s_ps->hash >> 32), count,
+                                depthControl.z_write_enable ? 1 : 0, s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF, color[0] ? 1 : 0, writeMask & 0xF, nearest);
+                        }
+                    }
+                }
+            }
+        }
+        else if (VelocityWanted() && depth)
+        {
+            static const bool logMotionView = std::getenv("NFSMW_LOG_MV") != nullptr;
+            if (logMotionView)
+                LogOnce(0x3200 ^ (depth->base * 31 + depth->pitch) ^ (color[0] ? color[0]->base * 7 + color[0]->pitch : 0) ^ (color[0] && color[0]->depth ? 0x10000 : 0) ^
+                    (color[3] ? 0x20000 : 0) ^ ((writeMask >> 12) & 0xF) * 0x300000,
+                    "[mv] velocity view skipped draws: depth base %u pitch %u, colour0 %s base %u pitch %u%s, colour3 %s%s, writeMask %08X",
+                    depth->base, depth->pitch, color[0] ? "yes" : "no", color[0] ? color[0]->base : 0, color[0] ? color[0]->pitch : 0,
+                    color[0] && color[0]->depth ? " (a depth surface)" : "", color[3] ? "yes" : "no",
+                    color[3] && color[3] != s_velocityTarget.get() ? " (the game's own)" : "", writeMask);
+        }
         // Before the textures are looked up: a draw into scaled targets
         // samples scaled textures (every attachment shares the pitch, so the scale).
         s_drawScaled = false;
@@ -9674,7 +10291,9 @@ void main()
             return;
 
         // Pipeline state.
-        const TextureLayout& layout = GetTextureLayout(*s_vs, *s_ps);
+        // (The velocity view's blur pass also samples the vehicles' velocity: binding 31.)
+        const bool velocityViewDraw = VelocityWanted() && FindShaderOverride(s_ps->hash);
+        const TextureLayout& layout = GetTextureLayout(*s_vs, *s_ps, velocityViewDraw ? 1u << kVelocityTextureBinding : 0u);
         PipelineKey key{};
         key.vs = s_vs->hash;
         key.ps = s_ps->hash;
@@ -9693,6 +10312,8 @@ void main()
             if (bc != 0x00010001 && color[i]->blendable && !(adoptedColor & (1u << i)))
                 key.blend[i] = bc;
         }
+        if (color[3] && color[3] == s_velocityTarget.get())
+            key.blend[3] = ~0u;  // (no blending into the host-only target)
         key.colorMask = writeMask;  // (none for adopted targets)
         if (depth)
         {
@@ -9711,8 +10332,69 @@ void main()
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
         // A pixel shader the renderer alters gets its own pipeline (PixelVariant).
-        key.pad = (s_motionBlurSetting == settings::kMotionBlurOff && FindShaderOverride(s_ps->hash)) ? kPipelineVariantMotionBlurOff : 0u;
-
+        key.pad = FindShaderOverride(s_ps->hash)
+            ? (s_motionBlurSetting == settings::kMotionBlurOff ? kPipelineVariantMotionBlurOff : 0u) |
+                (s_velocityView.load(std::memory_order_relaxed) ? kPipelineVariantVelocityView : 0u) |
+                (s_velocityView.load(std::memory_order_relaxed) && s_velocitySplit.load(std::memory_order_relaxed) ? kPipelineVariantSplitView : 0u) |
+                (s_motionBlurSetting == settings::kMotionBlurPerObject ? kPipelineVariantPerObjectBlur : 0u)
+            : 0u;
+        if (vehicleIndex >= 0)
+            key.pad |= kPipelineVariantVehicleVelocity;
+        const bool velocityDraw = (key.pad & (kPipelineVariantVelocityView | kPipelineVariantPerObjectBlur)) != 0;
+        if (velocityDraw)
+        {
+            // NFSMW_LOG_MV: what the blur pass reads each picture: whether the camera's record for the
+            // picture is there, whether it is a cut, and the camera's step as it was and as smoothed.
+            static const bool logBlurInput = std::getenv("NFSMW_LOG_MV") != nullptr;
+            static uint64_t s_inputFrame = ~0ull;
+            static uint32_t s_inputLines = 0;
+            const uint64_t inputFrame = gpu::FrameCount();
+            if (logBlurInput && inputFrame != s_inputFrame && s_inputLines < 30000)
+            {
+                s_inputFrame = inputFrame;
+                s_inputLines++;
+                motionvectors::Entry e;
+                const bool have = motionvectors::LookupEntry(inputFrame, e);
+                auto step = [](const motionvectors::Matrix& m) {
+                    const float pw = 0.99f * m[11] + m[15];
+                    return std::fabs(pw) > 1e-6f ? std::hypot((0.99f * m[8] + m[12]) / pw, (0.99f * m[9] + m[13]) / pw) : 0.0f;
+                };
+                fprintf(stderr, "[mvb] %llu record %d cut %d step %.5f smoothed %.5f guest pictures %llu\n", (unsigned long long)inputFrame,
+                    have ? 1 : 0, have && e.cut ? 1 : 0, have ? step(e.reprojection) : -1.0f, have ? step(e.smoothedReprojection) : -1.0f,
+                    (unsigned long long)motionvectors::g_guestPictures.load(std::memory_order_relaxed));
+            }
+            static const bool logBlur = std::getenv("NFSMW_LOG_MV") != nullptr;
+            static uint64_t s_lastBlur = ~0ull;
+            static uint32_t s_blurLines = 0;
+            const uint64_t f = gpu::FrameCount();
+            if (logBlur && f != s_lastBlur)
+            {
+                if (s_lastBlur != ~0ull && f - s_lastBlur != 1 && s_blurLines++ < 400)
+                    fprintf(stderr, "[mv] blur view drawn at frame %llu, previous at %llu\n", (unsigned long long)f, (unsigned long long)s_lastBlur);
+                s_lastBlur = f;
+            }
+            if (logBlur && s_velocityClearedPicture != f)
+            {
+                static uint32_t s_staleLines = 0;
+                if (s_staleLines++ < 200)
+                    fprintf(stderr, "[mv] blur reads velocity target cleared for picture %llu at frame %llu\n",
+                        (unsigned long long)s_velocityClearedPicture, (unsigned long long)f);
+            }
+            if (logBlur)
+            {
+                static uint64_t s_blurFrame = ~0ull;
+                static uint32_t s_blurLines2 = 0;
+                if (f != s_blurFrame)
+                {
+                    if (s_blurLines2++ < 300 && s_blurFrame != ~0ull)
+                        fprintf(stderr, "[mv] frame %llu: velocity target cleared %u times, %u vehicle draws after the last clear, %u before the blur\n",
+                            (unsigned long long)s_blurFrame, s_velocityClears, s_velocityDrawsSinceClear, s_velocityDrawsAtBlur);
+                    s_blurFrame = f;
+                    s_velocityClears = 0;
+                }
+                s_velocityDrawsAtBlur = s_velocityDrawsSinceClear;
+            }
+        }
         bool pipelinePending;
         VkPipeline pipeline = GetPipeline(key, layout.pipeline, pipelinePending);
         if (pipelinePending)
@@ -9735,6 +10417,12 @@ void main()
                     continue;
                 VkDescriptorImageInfo& ii = textureInfos[d * 32 + n];
                 ii = { s_sampler, s_dummy[d].view, VK_IMAGE_LAYOUT_GENERAL };
+                if (d == 0 && n == kVelocityTextureBinding)
+                {
+                    if (s_velocityTarget)
+                        ii.imageView = s_velocityTarget->image.view;
+                    continue;
+                }
                 if (!(s_exp & 8))  // NFSMW_GPU_EXP bit 8: placeholders only (texture cost experiment)
                     ii.imageView = GetTexture(n, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube, ii.sampler);
             }
@@ -9961,7 +10649,7 @@ void main()
         {
             bool uploadConstants = g_constantsDirty.load(std::memory_order_relaxed) ||
                 s_lastConstantsSubmission != s_submissionCounter || !s_recording ||
-                constLayoutVs != s_lastConstLayoutVs || constLayoutPs != s_lastConstLayoutPs;
+                constLayoutVs != s_lastConstLayoutVs || constLayoutPs != s_lastConstLayoutPs || velocityDraw || vehicleIndex >= 0;
             VkDeviceSize need = (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) +
                 (copyCount ? 256 + copyBytes : 0);
             if (need == 0)
@@ -9989,12 +10677,26 @@ void main()
                 };
                 copyStage(constLayoutVs, 0);    // pc.vsConstBase
                 copyStage(constLayoutPs, 256);  // pc.psConstBase
+                if (velocityDraw && constLayoutPs)
+                {
+                    // The velocity view's constants: slots the shader's packed constants leave free.
+                    float velocity[motionvectors::kSlots * 4];
+                    motionvectors::VelocityConstants(gpu::FrameCount(), velocity);
+                    memcpy(c + (256 + kVelocityConstants) * 16, velocity, sizeof(velocity));
+                }
                 s_lastConstLayoutVs = constLayoutVs;
                 s_lastConstLayoutPs = constLayoutPs;
                 memcpy(c + 512 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 48 * 16);
                 memcpy(c + 560 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 2 * 16);
                 memcpy(c + 562 * 16, &s_regs[XE_GPU_REG_SHADER_CONSTANT_LOOP_00], 8 * 16);
-                memset(c + 570 * 16, 0, 4 * 16);
+                memset(c + kDrawInfoSlot * 16, 0, 8 * 16);
+                if (vehicleIndex >= 0)
+                    memcpy(c + kDrawInfoSlot * 16, vehicleReprojection.data(), sizeof(motionvectors::Matrix));
+                if (velocityMarker)
+                {
+                    const uint32_t one = 1;
+                    memcpy(c + (kDrawInfoSlot + 5) * 16, &one, sizeof(one));
+                }
                 s_lastConstantsOffset = at;
                 s_lastConstantsSubmission = s_submissionCounter;
                 s_stats.constantUploads++;
@@ -10989,6 +11691,58 @@ void main()
                 }
             HfrDrawMatchRecord(key, constHash(s_vs, 0x4000), constHash(s_ps, 0x4400), vb, s_vs->info.constRelative, std::move(vsConsts));
         }
+        // NFSMW_LOG_CAR_DRAWS=1: which vertex shader constants hold a vehicle's
+        // matrices (to find where per-object motion vectors can take over),
+        // logged once per shader and slot. A match is a vehicle's world
+        // matrix times the picture's view-projection (WVP), the world matrix
+        // (W), the view-projection (VP) or a world position (POS), kept as
+        // four consecutive constants either as rows (A) or columns (B).
+        static const bool logCarDraws = std::getenv("NFSMW_LOG_CAR_DRAWS") != nullptr;
+        if (logCarDraws)
+        {
+            motionvectors::Entry entry;
+            if (motionvectors::LookupEntry(FrameCount(), entry))
+            {
+                static std::set<std::tuple<uint64_t, std::string, uint32_t>> seen;
+                auto constant = [&](uint32_t slot, uint32_t k) {
+                    float f;
+                    memcpy(&f, &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + slot * 4 + k], 4);
+                    return f;
+                };
+                auto close = [](float a, float b) { return std::fabs(a - b) <= 1e-3f * (1.0f + std::fabs(b)); };
+                auto report = [&](const char* what, const char* layout, uint32_t slot, size_t vehicle) {
+                    if (seen.insert({ s_vs->hash, std::string(what) + layout, slot }).second)
+                        fprintf(stderr, "[cardraw] vs_%016llx ps_%016llx %s as %s at c%u (vehicle %zu of %zu)\n", (unsigned long long)s_vs->hash,
+                            (unsigned long long)s_ps->hash, what, layout, slot, vehicle, entry.vehicles.size());
+                };
+                auto matchMatrix = [&](const char* what, const motionvectors::Matrix& m, size_t vehicle) {
+                    for (uint32_t s = 0; s + 4 <= 256; s++)
+                    {
+                        bool rows = true, columns = true;
+                        for (uint32_t r = 0; r < 4 && (rows || columns); r++)
+                            for (uint32_t k = 0; k < 4; k++)
+                            {
+                                rows = rows && close(constant(s + r, k), m[r * 4 + k]);
+                                columns = columns && close(constant(s + r, k), m[k * 4 + r]);
+                            }
+                        if (rows)
+                            report(what, "rows", s, vehicle);
+                        if (columns)
+                            report(what, "columns", s, vehicle);
+                    }
+                };
+                matchMatrix("VP", entry.viewProjection, 0);
+                for (size_t v = 0; v < entry.vehicles.size(); v++)
+                {
+                    const motionvectors::Matrix& w = entry.vehicles[v].world;
+                    matchMatrix("W", w, v);
+                    matchMatrix("WVP", motionvectors::Multiply(w, entry.viewProjection), v);
+                    for (uint32_t s = 0; s < 256; s++)
+                        if (close(constant(s, 0), w[12]) && close(constant(s, 1), w[13]) && close(constant(s, 2), w[14]))
+                            report("POS", "row", s, v);
+                }
+            }
+        }
         pc.vsConstBase = 0;
         pc.psConstBase = 256;
         pc.indexOffset = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
@@ -11084,6 +11838,19 @@ void main()
         {
             vkCmdSetDepthBias(s_cmd, bias[0], bias[1], bias[2]);
             memcpy(bound.bias, bias, sizeof(bias));
+        }
+
+        // A vehicle's draw: where a fragment is in guest clip space, from
+        // gl_FragCoord (the host viewport covers the whole target; the final
+        // posScale, after the ultrawide and bar adjustments above, is what
+        // the vertex shader used), for the velocity the pixel shader writes.
+        if (vehicleIndex >= 0)
+        {
+            float* map = reinterpret_cast<float*>(s_ringHost + constantsOffset + (kDrawInfoSlot + 4) * 16);
+            map[0] = 2.0f / (viewport.width * pc.posScale[0]);
+            map[1] = 2.0f / (viewport.height * pc.posScale[1]);
+            map[2] = (-1.0f - pc.posScale[2]) / pc.posScale[0];
+            map[3] = (-1.0f - pc.posScale[3]) / pc.posScale[1];
         }
 
         // Relative constant reads find the constants in g_ring, which every
@@ -11293,6 +12060,35 @@ void main()
         }
         if (inFlight < depth || std::chrono::steady_clock::now() - s_recordStart > std::chrono::microseconds(ageUs))
             SubmitRecorded(4);
+    }
+
+    bool VelocityViewOn()
+    {
+        return s_velocityView.load(std::memory_order_relaxed);
+    }
+
+    bool ToggleVehicleVectors()
+    {
+        const bool on = !s_vehicleVectors.load(std::memory_order_relaxed);
+        s_vehicleVectors.store(on, std::memory_order_relaxed);
+        fprintf(stderr, "[renderer] vehicle motion vectors %s\n", on ? "on" : "off");
+        return on;
+    }
+
+    bool VehicleVectorsOn()
+    {
+        return s_vehicleVectors.load(std::memory_order_relaxed);
+    }
+
+    bool ToggleVelocityView()
+    {
+        // Off, then the vectors over the whole picture, then split, then off.
+        const bool view = s_velocityView.load(std::memory_order_relaxed), split = s_velocitySplit.load(std::memory_order_relaxed);
+        const bool nextView = !view || !split;
+        s_velocitySplit.store(view && !split, std::memory_order_relaxed);
+        s_velocityView.store(nextView, std::memory_order_relaxed);
+        fprintf(stderr, "[renderer] motion vector view %s\n", !nextView ? "off" : view ? "split" : "on");
+        return nextView;
     }
 
     void Flush()

@@ -45,6 +45,7 @@
 #include "hfr_blend.h"
 #include "hfr_grid.h"
 #include "frame_time.h"
+#include <gpu/motion_vectors.h>
 
 #include <kernel/function.h>
 #include <kernel/write_watch.h>
@@ -58,9 +59,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <iterator>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1474,10 +1477,159 @@ SB_HOOK(sub_824E9C38)
     car.step = Step(base);
 }
 
+// The vertex buffers of the parts a car is built from: its CarRenderInfo's part table (+0xB78: a model per slot,
+// model and level of detail, each an eModel whose word 3 points to its eSolid) and the buffer addresses found in
+// each eSolid's first words (cached by solid). The result is rebuilt only when the car's set of solids changes
+// (the player's customization, a level of detail the game loads).
+static std::shared_ptr<const std::vector<uint32_t>> CarPartBuffers(uint8_t* base, uint32_t object)
+{
+    static std::unordered_map<uint32_t, std::pair<uint64_t, std::shared_ptr<const std::vector<uint32_t>>>> cars;
+    const uint32_t info = PPC_LOAD_U32(object + 68);
+    if (!info)
+        return nullptr;
+    auto plausible = [](uint32_t p) { return p >= 0x10000000 && p < 0xC0000000 && (p & 3) == 0; };
+    std::vector<uint32_t> solids;
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 380; i++)
+    {
+        const uint32_t model = PPC_LOAD_U32(info + 0xB78 + i * 4) & ~3u;
+        if (!plausible(model) || !PPC_LOAD_U32(model + 8))
+            continue;
+        const uint32_t solid = PPC_LOAD_U32(model + 12);
+        if (!plausible(solid))
+            continue;
+        solids.push_back(solid);
+        hash = (hash ^ solid) * 1099511628211ull;
+    }
+    if (solids.empty())
+        return nullptr;
+    auto& cached = cars[object];
+    if (cached.second && cached.first == hash)
+        return cached.second;
+    std::sort(solids.begin(), solids.end());
+    solids.erase(std::unique(solids.begin(), solids.end()), solids.end());
+    auto all = std::make_shared<std::vector<uint32_t>>();
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    for (const uint32_t solid : solids)
+    {
+        // A solid owns its block: up to the next solid in its list (they are laid out one after the other).
+        const uint32_t next = PPC_LOAD_U32(solid + 4) - 4;
+        uint32_t size = 0x80000;
+        if (next > solid && next - solid <= 0x100000)
+            size = next - solid;
+        ranges.emplace_back(solid & 0x1FFFFFFF, (solid & 0x1FFFFFFF) + size);
+    }
+    std::sort(ranges.begin(), ranges.end());
+    for (const auto& r : ranges)
+    {
+        if (!all->empty() && r.first <= all->back())
+            all->back() = std::max(all->back(), r.second);
+        else
+        {
+            all->push_back(r.first);
+            all->push_back(r.second);
+        }
+    }
+    cached = { hash, all };
+    return all;
+}
+
+// NFSMW_FIND_SMACKABLES=1: a diagnostic. Scans the guest heap for objects laid out as the decompilation's
+// SmackableRenderConn (0x8C bytes: a list node at +0x10, mRenderMatrix at +0x48 with its w column 0,0,0,1, mLOD
+// at +0x88) and logs them, with any static word that points at one's node (the list's head).
+#ifdef _WIN32
+static void FindSmackables(uint8_t* base, int pass)
+{
+    auto word = [&](uint32_t a) { uint32_t v; memcpy(&v, base + a, 4); return __builtin_bswap32(v); };
+    auto flt = [&](uint32_t a) { const uint32_t v = word(a); float f; memcpy(&f, &v, 4); return f; };
+    auto pointer = [](uint32_t p) { return p >= 0x82000000 && p < 0xC0000000 && (p & 3) == 0; };
+    std::vector<uint32_t> found, matrices;
+    uint64_t matrixOnly = 0, withLod = 0;
+    uint8_t* cursor = base + 0x40000000;
+    uint8_t* const end = base + 0xC0000000;
+    while (cursor < end)
+    {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery(cursor, &info, sizeof(info)))
+            break;
+        uint8_t* const regionEnd = std::min(end, static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize);
+        const bool readable = info.State == MEM_COMMIT && (info.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY)) && !(info.Protect & PAGE_GUARD);
+        if (readable)
+            for (uint32_t a = uint32_t(cursor - base); a + 0x8C <= uint32_t(regionEnd - base); a += 4)
+            {
+                if (word(a + 0x84) != 0x3F800000 || word(a + 0x54) || word(a + 0x64) || word(a + 0x74))
+                    continue;
+                bool shape = true;
+                for (uint32_t r = 0; r < 3 && shape; r++)
+                {
+                    const float x = flt(a + 0x48 + r * 16), y = flt(a + 0x4C + r * 16), z = flt(a + 0x50 + r * 16);
+                    const float length = std::sqrt(x * x + y * y + z * z);
+                    shape = length > 0.5f && length < 2.0f;
+                }
+                const float sx = flt(a + 0x78), sy = flt(a + 0x7C), sz = flt(a + 0x80);
+                if (!shape || !(std::fabs(sx) < 50000.0f && std::fabs(sy) < 50000.0f && std::fabs(sz) < 50000.0f))
+                    continue;
+                matrixOnly++;
+                matrices.push_back(a);
+                if (matrixOnly % 2000 == 1)
+                    fprintf(stderr, "[smack]   matrix-only %08X: +10 %08X +14 %08X +18 %08X +1C %08X +30 %08X +88 %08X\n", a, word(a + 0x10), word(a + 0x14), word(a + 0x18), word(a + 0x1C), word(a + 0x30), word(a + 0x88));
+                const uint32_t lod = word(a + 0x88);
+                if (lod > 4)
+                    continue;
+                withLod++;
+                if (!pointer(word(a + 0x10)) || !pointer(word(a + 0x14)))
+                    continue;
+                const uint32_t model = word(a + 0x30), hierarchy = word(a + 0x1C);
+                if ((model && !pointer(model)) || (hierarchy && !pointer(hierarchy)))
+                    continue;
+                bool sane = true;
+                for (uint32_t r = 0; r < 3 && sane; r++)
+                {
+                    const float x = flt(a + 0x48 + r * 16), y = flt(a + 0x4C + r * 16), z = flt(a + 0x50 + r * 16);
+                    const float length = std::sqrt(x * x + y * y + z * z);
+                    sane = length > 0.5f && length < 2.0f;
+                }
+                const float tx = flt(a + 0x78), ty = flt(a + 0x7C), tz = flt(a + 0x80);
+                if (!sane || !(std::fabs(tx) < 50000.0f && std::fabs(ty) < 50000.0f && std::fabs(tz) < 50000.0f))
+                    continue;
+                found.push_back(a);
+            }
+        cursor = regionEnd;
+    }
+    fprintf(stderr, "[smack] pass %d: %zu candidates (matrix shape only %llu, with lod %llu)\n", pass, found.size(),
+        (unsigned long long)matrixOnly, (unsigned long long)withLod);
+    motionvectors::g_guestBase = base;
+    motionvectors::g_matrixCandidates = std::move(matrices);
+    motionvectors::g_matchPending.store(true);
+    std::set<uint32_t> nodes;
+    for (const uint32_t a : found)
+        nodes.insert(a + 0x10);
+    for (size_t i = 0; i < found.size() && i < 60; i++)
+        fprintf(stderr, "[smack]   obj %08X hash %08X next %08X prev %08X model %08X lod %u pos %.2f %.2f %.2f\n", found[i], word(found[i] + 0x18),
+            word(found[i] + 0x10), word(found[i] + 0x14), word(found[i] + 0x30), word(found[i] + 0x88), flt(found[i] + 0x78), flt(found[i] + 0x7C), flt(found[i] + 0x80));
+    // A word in the game's data that points at a candidate's node: the list's head (and tail).
+    uint32_t heads = 0;
+    for (uint32_t a = 0x82000000; a < 0x83000000 && heads < 20; a += 4)
+        if (nodes.count(word(a)))
+        {
+            fprintf(stderr, "[smack] static %08X -> node %08X (next %08X)\n", a, word(a), word(word(a)));
+            heads++;
+        }
+}
+#endif
+
 // A view setup: records the camera each view of the real picture used.
 extern "C" PPC_FUNC(__imp__sub_8243EAC0);
 SB_HOOK(sub_8243EAC0)
 {
+#ifdef _WIN32
+    if (std::getenv("NFSMW_FIND_SMACKABLES"))
+    {
+        static uint32_t s_scans = 0;
+        if (motionvectors::g_scanRequested.exchange(false))
+            FindSmackables(base, int(++s_scans));
+    }
+#endif
     const uint32_t view = ctx.r4.u32;
     // M3: an in-between picture that leaves a pass out keeps that pass's
     // views as the real picture set them up (KeepView).
@@ -1492,7 +1644,131 @@ SB_HOOK(sub_8243EAC0)
             c.step = Step(base);
         }
     hfrdiag::OnViewSetup(base, view);
+    const uint32_t matrices = ctx.r3.u32;
     SB_ORIGINAL(sub_8243EAC0)(ctx, base);
+    // The player's view (id 1) lays out its matrices at the first argument:
+    // view +0, projection +64, view-projection +128 (16 floats each).
+    if (matrices && PPC_LOAD_U32(view + 4) == 1)
+    {
+        motionvectors::Matrix v, vp;
+        Load(base, matrices, v.data());
+        Load(base, matrices + 128, vp.data());
+        // The vehicle render list (the same one hfr_diag reads): render objects, count.
+        std::vector<motionvectors::Vehicle> vehicles;
+        const uint32_t items = PPC_LOAD_U32(0x82C84D3C), count = PPC_LOAD_U32(0x82C84D44);
+        if (items && count < 64)
+            for (uint32_t i = 0; i < count; i++)
+                if (const uint32_t object = PPC_LOAD_U32(items + i * 4))
+                {
+                    motionvectors::Vehicle car;
+                    car.id = object;
+                    Load(base, object + kCarMatrix, car.world.data());
+                    // An object not yet placed has no position: nothing to draw.
+                    if (car.world[12] == 0.0f && car.world[13] == 0.0f && car.world[14] == 0.0f)
+                        continue;
+                    float wheels[4][3], radius = 0.0f;
+                    for (int w = 0; w < 4; w++)
+                    {
+                        for (int k = 0; k < 3; k++)
+                        {
+                            const uint32_t raw = PPC_LOAD_U32(object + 144 + w * 16 + k * 4);
+                            memcpy(&wheels[w][k], &raw, 4);
+                        }
+                        const uint32_t raw = PPC_LOAD_U32(object + 208 + w * 4);
+                        float r;
+                        memcpy(&r, &raw, 4);
+                        radius = std::max(radius, r);
+                    }
+                    motionvectors::BoxFromWheels(wheels, radius, car);
+                    car.buffers = CarPartBuffers(base, object);
+                    static const bool logVel = std::getenv("NFSMW_LOG_CAR_VEL") != nullptr;
+                    static uint32_t s_velLines = 0;
+                    static float s_velPrev[3];
+                    static uint32_t s_velObject = 0;
+                    if (logVel && s_velLines < 400 && (s_velObject == 0 || s_velObject == object) &&
+                        std::fabs(car.world[12] - s_velPrev[0]) + std::fabs(car.world[13] - s_velPrev[1]) + std::fabs(car.world[14] - s_velPrev[2]) > 0.02f)
+                    {
+                        s_velObject = object;
+                        std::string line;
+                        for (uint32_t o = 0; o < 1280; o += 4)
+                        {
+                            uint32_t raw = PPC_LOAD_U32(object + o);
+                            float f;
+                            memcpy(&f, &raw, 4);
+                            if (std::fabs(f) > 0.3f && std::fabs(f) < 150.0f && o != kCarMatrix + 48 && o != kCarMatrix + 52 && o != kCarMatrix + 56)
+                                line += std::format(" {}:{:.2f}", o, f);
+                        }
+                        const float dx = car.world[12] - s_velPrev[0], dy = car.world[13] - s_velPrev[1], dz = car.world[14] - s_velPrev[2];
+                        fprintf(stderr, "[carvel] step %.3f%s\n", std::sqrt(dx * dx + dy * dy + dz * dz), line.c_str());
+                        memcpy(s_velPrev, &car.world[12], sizeof(s_velPrev));
+                        s_velLines++;
+                    }
+                    memcpy(car.wheels, wheels, sizeof(wheels));
+                    car.hasWheels = true;
+                    car.radius = radius;
+                    vehicles.push_back(car);
+                    // NFSMW_LOG_CAR_MODELS=1: the car's part model table (CarRenderInfo + 0xB78, as the decompilation
+                    // lays it out) and the words of each model and of what it points to, to find where a model keeps
+                    // its vertex buffers.
+                    static const bool logModels = std::getenv("NFSMW_LOG_CAR_MODELS") != nullptr;
+                    static std::set<uint32_t> modelsLogged;
+                    if (logModels && modelsLogged.size() < 12)
+                    {
+                        const uint32_t info = PPC_LOAD_U32(object + kCarInfo);
+                        if (info && modelsLogged.insert(object).second)
+                        {
+                            auto plausible = [](uint32_t p) { return p >= 0x10000000 && p < 0xC0000000 && (p & 3) == 0; };
+                            fprintf(stderr, "[carmodel] car %08X info %08X\n", object, info);
+                            uint32_t shown = 0;
+                            for (uint32_t i = 0; i < 380 && shown < 40; i++)
+                            {
+                                const uint32_t model = PPC_LOAD_U32(info + 0xB78 + i * 4) & ~3u;
+                                if (!plausible(model))
+                                    continue;
+                                shown++;
+                                std::string line;
+                                for (uint32_t o = 0; o < 64; o += 4)
+                                    line += std::format(" {:X}", PPC_LOAD_U32(model + o));
+                                fprintf(stderr, "[carmodel] entry %u (slot %u model %u lod %u) %08X:%s\n", i, i / 20, (i / 5) % 4, i % 5, model, line.c_str());
+                                for (uint32_t o = 0; o < 32; o += 4)
+                                {
+                                    const uint32_t target = PPC_LOAD_U32(model + o);
+                                    if (!plausible(target) || target == model)
+                                        continue;
+                                    std::string words;
+                                    for (uint32_t w = 0; w < 96; w++)
+                                        words += std::format(" {:X}", PPC_LOAD_U32(target + w * 4));
+                                    fprintf(stderr, "[carmodel]   +%u -> %08X:%s\n", o, target, words.c_str());
+                                }
+                            }
+                        }
+                    }
+                    static const bool dump = std::getenv("NFSMW_LOG_CAR_OBJECT") != nullptr;
+                    static std::set<uint32_t> dumped;
+                    if (dump && dumped.size() < 16 && dumped.insert(object).second)
+                    {
+                        // Floats that could be a model's size: |v| between 0.2 and 12.
+                        auto scan = [&](const char* what, uint32_t at, uint32_t bytes) {
+                            std::string line;
+                            for (uint32_t o = 0; o < bytes; o += 4)
+                            {
+                                uint32_t raw = PPC_LOAD_U32(at + o);
+                                float f;
+                                memcpy(&f, &raw, 4);
+                                if (std::fabs(f) > 0.2f && std::fabs(f) < 12.0f)
+                                    line += std::format(" {}:{:.2f}", o, f);
+                            }
+                            fprintf(stderr, "[carobj] %08X %s %08X:%s\n", object, what, at, line.c_str());
+                        };
+                        fprintf(stderr, "[carobj] %08X world pos %.2f %.2f %.2f, x axis %.2f %.2f %.2f, z axis %.2f %.2f %.2f\n", object,
+                            car.world[12], car.world[13], car.world[14], car.world[0], car.world[1], car.world[2], car.world[8], car.world[9], car.world[10]);
+                        scan("object", object, 1280);
+                        if (const uint32_t info = PPC_LOAD_U32(object + kCarInfo))
+                            scan("info", info, 2048);
+                    }
+                }
+        motionvectors::Publish(v, vp, std::move(vehicles));
+    }
 }
 
 // A camera's update (sub_82161000: keeps its last pose at +224 and derives
@@ -1695,7 +1971,8 @@ SB_HOOK(sub_82456030)
 extern "C" PPC_FUNC(__imp__sub_82444178);
 SB_HOOK(sub_82444178)
 {
-    if (Skip(kSkipView4))
+    static const bool noReflections = std::getenv("NFSMW_NO_REFLECTIONS") != nullptr;
+    if (noReflections || Skip(kSkipView4))
         return;
     SB_ORIGINAL(sub_82444178)(ctx, base);
 }
@@ -1719,7 +1996,8 @@ SB_HOOK(sub_822234F0)
 extern "C" PPC_FUNC(__imp__sub_82444520);
 SB_HOOK(sub_82444520)
 {
-    if (Skip(kSkipEnv))
+    static const bool noReflections = std::getenv("NFSMW_NO_REFLECTIONS") != nullptr;
+    if (noReflections || Skip(kSkipEnv))
         return;
     SB_ORIGINAL(sub_82444520)(ctx, base);
 }

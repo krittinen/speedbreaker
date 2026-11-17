@@ -186,6 +186,7 @@ namespace settings
         constexpr EnumEntry kMotionBlurEntries[] = {
             { kMotionBlurOriginal, "original", "Original" },
             { kMotionBlurOff, "off", "Off" },
+{ kMotionBlurPerObject, "per_object", "Per-object" },
         };
 
         constexpr EnumEntry kAnisotropyEntries[] = {
@@ -362,7 +363,7 @@ namespace settings
               .env = "NFSMW_SHADOW_RESOLUTION", .defaultValue = kShadowResolutionDefault, .entries = kShadowResolutionEntries },
             { .id = Id::MotionBlur, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Live,
               .table = "video", .key = "motion_blur", .label = "Motion Blur",
-              .description = "The game's screen-wide blur while boosting and at speed. Off removes it and keeps the rest of the picture.",
+              .description = "The game's screen-wide blur while boosting and at speed. Off removes it and keeps the rest of the picture. Per-object (experimental) blurs along each object's own motion, the camera's and the vehicles', instead.",
               .env = "NFSMW_MOTION_BLUR", .defaultValue = kMotionBlurOriginal, .entries = kMotionBlurEntries },
             { .id = Id::WindowWidth, .category = Category::Display, .type = Type::Int, .apply = Apply::Restart, .hidden = true,
               .table = "video", .key = "window_width", .label = "Window Width",

@@ -79,7 +79,7 @@ layout(std140, set = 0, binding = 1) uniform XenosConstants
     uvec4 fetch[48];      // 32 fetch constants x 6 dwords
     uvec4 bools[2];       // 256 bool constants
     uvec4 loops[8];       // 32 loop constants
-    uvec4 drawInfo[4];    // see gpu/renderer.cpp
+    uvec4 drawInfo[8];    // see gpu/renderer.cpp
 } u;
 
 layout(push_constant) uniform DrawConstants

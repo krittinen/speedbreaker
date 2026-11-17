@@ -88,6 +88,16 @@ namespace gpu::renderer
     bool PresentFrontBuffer(const uint32_t fetch[6], uint32_t width, uint32_t height, float between = 0.0f, float shift = 0.0f,
         int64_t target = 0);
 
+    // F9 (ui): cycles the motion vector view (gpu/motion_vectors.h), drawn by the
+    // blur pass: off, the vectors in place of the picture, then split (the
+    // picture on the left half, the vectors on the right). Returns whether it is on.
+    bool ToggleVelocityView();
+    bool VelocityViewOn();
+    // F10 (ui): toggles the vehicles' own motion vectors (written by their draws,
+    // joining the camera's in the blur and the vector view). Returns the new state.
+    bool ToggleVehicleVectors();
+    bool VehicleVectorsOn();
+
     // After each swap (NFSMW_PASS_PROFILE=<frame> prints that frame's passes).
     void OnSwap(uint64_t frame);
 
